@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+
+# Editors / temp
+*~
+*.swp
+*.swo
+*.bak
+*.tmp
+*.log
+
+# ESP-IDF build outputs
+build/
+*.bin
+*.elf
+*.map
+sdkconfig
+sdkconfig.old
+managed_components/
+compile_commands.json
+.clangd/
+.cache/
+
+# Local ESP-IDF installer (EIM) config
+eim_config.toml
+
+# Agent skills are installed locally from skills-lock.json
+.agents/
+
+# Local editor config (ESP-IDF extension writes absolute paths here)
+.vscode/

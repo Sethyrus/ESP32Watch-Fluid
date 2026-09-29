@@ -1,0 +1,10 @@
+dependencies:
+  idf: ">=5.5,<5.6"
+  waveshare/esp32_s3_touch_amoled_2_06: "^1.0.6"
+  lvgl/lvgl:
+    version: "9.3.0"
+    public: true
+  watch_board:
+    git: https://github.com/Sethyrus/ESP32Watch-core.git
+    path: components/watch_board
+    version: v0.1.1

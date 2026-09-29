@@ -1,0 +1,40 @@
+# ESP-IDF 5.5.4 baseline for Waveshare ESP32-S3-Touch-AMOLED-2.06.
+CONFIG_IDF_TARGET="esp32s3"
+
+# Official Waveshare examples use QIO and 16 MB. The wiki and schematic
+# (`GD25Q256EYIGR`) indicate 32 MB; verify with esptool.py flash_id before
+# switching the durable config to 32 MB.
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# PSRAM holds the frame triple buffer; hot simulation buffers stay internal.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
+CONFIG_SPIRAM_RODATA=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=4096
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+
+CONFIG_FREERTOS_HZ=1000
+
+# BSP runtime defaults made durable for clean checkouts.
+CONFIG_BSP_I2C_NUM=1
+CONFIG_BSP_I2C_FAST_MODE=y
+CONFIG_BSP_SPIFFS_MOUNT_POINT="/spiffs"
+CONFIG_BSP_SPIFFS_PARTITION_LABEL="storage"
+CONFIG_BSP_SPIFFS_MAX_FILES=2
+CONFIG_BSP_SD_MOUNT_POINT="/sdcard"
+CONFIG_BSP_LCD_RGB_BOUNCE_BUFFER_HEIGHT=20
+CONFIG_BSP_I2S_NUM=1
+
+# LVGL is linked through the BSP but never started: the app draws straight to the
+# panel (components/fluid_app). No LVGL options are needed.

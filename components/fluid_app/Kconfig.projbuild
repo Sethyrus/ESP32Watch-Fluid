@@ -1,0 +1,39 @@
+menu "Fluid simulation"
+
+    config FLUID_CELL_PX
+        int "Pressure grid cell size (px)"
+        range 6 16
+        default 10
+        help
+            Main quality/cost knob. Smaller cells mean more particles and finer
+            detail, and cost roughly quadratically more CPU.
+
+    config FLUID_FILL_PERCENT
+        int "Share of the screen filled with fluid (%)"
+        range 10 70
+        default 40
+
+    config FLUID_SUBSTEPS
+        int "Simulation substeps per frame"
+        range 1 4
+        default 1
+
+    config FLUID_PRESSURE_ITERS
+        int "Pressure solver iterations per substep"
+        range 5 60
+        default 30
+
+    config FLUID_GRAVITY_PX_PER_G
+        int "Gravity scale (px/s^2 per g)"
+        range 300 6000
+        default 1800
+        help
+            How fast the fluid falls. Real scale would be far too fast; ~1800
+            makes the screen feel like a ~0.3 m tall tank.
+
+    config FLUID_BRIGHTNESS
+        int "Display brightness (%)"
+        range 10 100
+        default 80
+
+endmenu
