@@ -71,6 +71,23 @@ void fluid_reset(fluid_t *fluid);
 // Circular obstacle (e.g. a finger). Velocity in px/s. Takes effect on the next step.
 void fluid_set_obstacle(fluid_t *fluid, float x, float y, float radius, float vx, float vy, bool active);
 
+// Static walls given as a signed distance in screen px (negative inside a wall), e.g.
+// clock digits. Sampled once here (the callback is not kept); NULL removes them.
+// Particles caught inside a new wall are pushed out gradually over a few steps.
+// Call between steps, from the thread that steps.
+typedef float (*fluid_sdf_fn)(void *ctx, float x, float y);
+void fluid_set_walls(fluid_t *fluid, fluid_sdf_fn sdf, void *ctx);
+
+// Changes on every fluid_set_walls(); 0 until walls are first set.
+uint32_t fluid_walls_version(const fluid_t *fluid);
+
+// Sampled wall distance in screen px (large and positive where there are no walls).
+float fluid_wall_sdf(const fluid_t *fluid, float x, float y);
+
+// Throws the fluid along (dir_x, dir_y) (unit vector) at up to speed px/s, unevenly
+// per particle, so the surface breaks up.
+void fluid_splash(fluid_t *fluid, float dir_x, float dir_y, float speed);
+
 // Advances dt seconds split in `substeps`. Gravity in px/s^2, screen axes.
 void fluid_step(fluid_t *fluid, float gravity_x, float gravity_y, float dt, int substeps);
 

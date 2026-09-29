@@ -1,6 +1,8 @@
 # ESP32Watch-Fluid
 
-Simulacion de fluido para la Waveshare **ESP32-S3-Touch-AMOLED-2.06**, al estilo de los colgantes de "matriz LED" con liquido. Es un FLIP/PIC en tiempo real que sigue la gravedad real medida por el IMU. Se pinta directamente al AMOLED, sin LVGL, y solo se envian las zonas que cambian.
+Simulacion de fluido para la Waveshare **ESP32-S3-Touch-AMOLED-2.06**, al estilo de los colgantes de "matriz LED" con liquido. Es un FLIP/PIC en tiempo real que sigue la gravedad real medida por el IMU. Se pinta directamente al AMOLED y solo se envian las zonas que cambian; LVGL solo se usa para el menu de ajustes.
+
+Tambien es un reloj: los digitos de la hora son paredes, y el fluido fluye a su alrededor.
 
 ## Controles
 
@@ -8,11 +10,21 @@ Simulacion de fluido para la Waveshare **ESP32-S3-Touch-AMOLED-2.06**, al estilo
 | --- | --- |
 | Mover el fluido | Inclinar o girar el reloj: cae hacia el "abajo" real. Al sacudirlo, salpica. |
 | Remover | Tocar y arrastrar el dedo sobre la pantalla |
-| Cambiar estilo (LED, Pixel, Liquid) | Pulsacion corta de `BOOT` |
-| Cambiar paleta (agua, lava, toxic) | Pulsacion larga de `BOOT` (~0,7 s) |
+| Abrir y cerrar el menu | Pulsacion corta de `PWR` |
+| Cambiar estilo (LED, Pixel, Liquido) | Pulsacion corta de `BOOT` (atajo) |
+| Cambiar paleta (Agua, Lava, Toxico) | Pulsacion larga de `BOOT`, ~0,7 s (atajo) |
 
-- No hay calibracion: el reloj plano sobre la mesa deja el fluido flotando, sin gravedad, y en vertical cae al fondo.
-- `PWR` no hace nada, porque es la pantalla raiz de la app. No mantenerlo unos 6 s: apaga la placa.
+**Menu (`PWR`):**
+- Opciones: estilo, paleta, reloj si/no, ajustar hora, brillo, reiniciar el fluido y continuar.
+- Se cierra con `Continuar`, `PWR` o `BOOT`.
+- Mientras esta abierto, el fluido queda congelado y atenuado detras.
+- Los ajustes se guardan en NVS y se conservan al reiniciar.
+
+**Notas:**
+- **Sin calibracion:** el reloj plano sobre la mesa deja el fluido flotando, sin gravedad, y en vertical cae al fondo.
+- **Hora:** la guarda el RTC. Si la pierde (sin bateria), se pone la hora de compilacion; se ajusta desde el menu.
+- **`PWR`:** no mantenerlo unos 6 s, porque apaga la placa.
+- **Secreto:** hay un easter egg. Pista: agitalo con ganas.
 
 ## Compilar y flashear
 
@@ -25,7 +37,7 @@ idf.py build
 idf.py -p <PORT> flash monitor   # p. ej. /dev/tty.usbmodem1101; sin -p lo autodetecta
 ```
 
-La calidad y el coste se ajustan en `idf.py menuconfig` > *Fluid simulation*: tamano de celda, relleno, substeps, iteraciones, gravedad y brillo. Los valores que se queden deben ir a `sdkconfig.defaults`.
+La calidad y el coste se ajustan en `idf.py menuconfig` > *Fluid simulation*: tamano de celda, relleno, substeps, iteraciones, gravedad, brillo inicial, reloj por defecto y RTC. Los valores que se queden deben ir a `sdkconfig.defaults`.
 
 ### Benchmark en el ordenador
 
@@ -38,22 +50,23 @@ El motor es C puro y tambien compila en el host. El benchmark tiene cuatro funci
 ```sh
 tools/host_bench/run.sh                           # valores por defecto
 tools/host_bench/run.sh --cell 8 --iters 20 --out frames
+tools/host_bench/run.sh --clock 1259 --splash 18 --palette 3   # reloj, salpicadura, arcoiris
 ```
 
 ## Estado
 
-Primera version:
-- funcionan la simulacion, los tres estilos, las paletas, el tacto y BOOT;
-- en el host pasan las comprobaciones;
-- las medidas en el reloj estan pendientes (ver [docs/FLUID_DESIGN.md](docs/FLUID_DESIGN.md)).
+- **Funciona:** la simulacion, los tres estilos, las paletas, el tacto, BOOT, el menu, el reloj y el RTC.
+- **Comprobaciones del host:** pasan, tambien con dos hilos y con TSan.
+- **En el reloj:** ~41 fps con el reloj activado (ver medidas en [docs/FLUID_DESIGN.md](docs/FLUID_DESIGN.md)).
 
 ## Estructura
 
 | Ruta | Contenido |
 | --- | --- |
 | `main/main.c` | Arranque. |
-| `components/fluid_engine/` | Motor en C puro: simulacion FLIP (`fluid_sim`), rejilla LED (`fluid_raster`) y render por franjas con deteccion de cambios (`fluid_render`). |
-| `components/fluid_app/` | Parte ESP32: pantalla sin LVGL, tareas (simulacion en el core 1, render y DMA en el core 0), IMU, tacto, BOOT y Kconfig. |
+| `components/fluid_engine/` | Motor en C puro: simulacion FLIP con paredes (`fluid_sim`), digitos del reloj (`fluid_clock`), rejilla LED (`fluid_raster`) y render por franjas con deteccion de cambios (`fluid_render`). |
+| `components/fluid_app/` | Parte ESP32: pantalla, tareas (simulacion en el core 1, render y DMA en el core 0), IMU, tacto, botones, NVS, menu LVGL (`fluid_menu`) y Kconfig. |
+| `components/watch_rtc/` | Driver minimo del RTC PCF85063. Candidato a pasar a `watch_board` en core. |
 | `tools/host_bench/` | Benchmark y comprobaciones en el ordenador. |
 | `docs/FLUID_DESIGN.md` | Analisis, decisiones, presupuesto de rendimiento, medidas y siguientes pasos. |
 

@@ -1,8 +1,11 @@
 #include "fluid_app.h"
 
 #include <inttypes.h>
+#include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
@@ -14,11 +17,16 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "fluid_clock.h"
+#include "fluid_menu.h"
 #include "fluid_raster.h"
 #include "fluid_render.h"
 #include "fluid_sim.h"
 #include "imu_service.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "watch_buttons.h"
+#include "watch_rtc.h"
 
 #define FLUID_W BSP_LCD_H_RES
 #define FLUID_H BSP_LCD_V_RES
@@ -28,7 +36,7 @@
 #define FLUID_RENDER_CORE 0
 #define FLUID_TASK_PRIORITY 5
 #define FLUID_SIM_STACK 6144
-#define FLUID_RENDER_STACK 4096
+#define FLUID_RENDER_STACK 8192 // also runs LVGL for the menu
 #define FLUID_HELPER_STACK 3072
 #define FLUID_HELPER_PRIORITY (FLUID_TASK_PRIORITY + 1)
 // Render above the helper: it mostly sleeps on the display DMA and, when a band is
@@ -42,6 +50,18 @@
 #define FLUID_DT_MIN (1.0f / 120.0f)
 #define FLUID_DT_MAX (1.0f / 30.0f)
 #define FLUID_TOUCH_RETRY_US 100000
+#define FLUID_PWR_POLL_US 50000 // AXP2101 latches the press; no need to read every frame
+#define FLUID_MENU_POLL_MS 20
+// Shake easter egg: three peaks of the (smoothed) screen-plane acceleration within
+// the window. imu_service low-passes the samples, so real peaks read lower than they
+// are; the threshold is tuned for that. Each peak is logged for tuning.
+#define FLUID_SHAKE_G 1.8f
+#define FLUID_SHAKE_PEAKS 3
+#define FLUID_SHAKE_GAP_US 100000
+#define FLUID_SHAKE_WINDOW_US 1500000
+#define FLUID_SHAKE_COOLDOWN_US 2000000
+#define FLUID_SPLASH_SPEED 1400.0f
+#define FLUID_NVS_NAMESPACE "fluid"
 
 static const char *TAG = "fluid_app";
 
@@ -71,6 +91,19 @@ static esp_lcd_touch_handle_t s_touch;
 static uint16_t *s_dma[2];
 static int s_dma_next;
 static TaskHandle_t s_render_task;
+
+// Settings: written by the sim task, and by the menu (render task) only while the
+// sim task waits for it to close (s_menu_open orders the hand-over).
+static fluid_settings_t s_settings;
+static atomic_bool s_menu_open;
+static atomic_bool s_menu_close_request;
+static fluid_menu_result_t s_menu_result;
+static uint16_t *s_snapshot; // menu background, PSRAM
+static float s_foam_speed_default;
+
+static fluid_clock_t s_clock;
+static bool s_walls_on;
+static int64_t s_clock_minute = -1;
 
 // Second half of each simulation stage runs on core 0 (fluid_config_t.parallel). The
 // render task there mostly waits on the display DMA, so the helper borrows that time.
@@ -160,7 +193,7 @@ static esp_err_t init_display(void)
     }
     s_dma_next = 1;
 
-    err = bsp_display_brightness_set(CONFIG_FLUID_BRIGHTNESS);
+    err = bsp_display_brightness_set(s_settings.brightness);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Brightness set failed: %s", esp_err_to_name(err));
     }
@@ -193,6 +226,8 @@ static esp_err_t init_engine(void)
         return ESP_ERR_NO_MEM;
     }
     s_raster_fine.blur = true;
+    s_foam_speed_default = s_raster_led.foam_speed;
+    fluid_clock_init(&s_clock, FLUID_W, FLUID_H);
 
     int max_cells = 0;
     int max_pitch = 0;
@@ -300,6 +335,162 @@ static void poll_touch(int64_t now, float dt, uint32_t *errors)
     fluid_set_obstacle(s_fluid, x, y, FLUID_FINGER_RADIUS, vx, vy, true);
 }
 
+// Settings persist in NVS; missing keys keep the Kconfig defaults.
+static void settings_load(void)
+{
+    s_settings = (fluid_settings_t){
+        .style = FLUID_STYLE_LED,
+        .palette = 0,
+#if CONFIG_FLUID_CLOCK_DEFAULT
+        .clock = true,
+#endif
+        .brightness = CONFIG_FLUID_BRIGHTNESS,
+    };
+    nvs_handle_t h;
+    if (nvs_open(FLUID_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+    uint8_t v;
+    if (nvs_get_u8(h, "style", &v) == ESP_OK && v < FLUID_STYLE_COUNT) s_settings.style = v;
+    if (nvs_get_u8(h, "rainbow", &v) == ESP_OK) s_settings.rainbow_unlocked = v != 0;
+    int palettes = s_settings.rainbow_unlocked ? FLUID_PALETTE_COUNT : FLUID_PALETTE_RAINBOW;
+    if (nvs_get_u8(h, "palette", &v) == ESP_OK && v < palettes) s_settings.palette = v;
+    if (nvs_get_u8(h, "clock", &v) == ESP_OK) s_settings.clock = v != 0;
+    if (nvs_get_u8(h, "bright", &v) == ESP_OK && v >= 10 && v <= 100) s_settings.brightness = v;
+    nvs_close(h);
+}
+
+static void settings_save(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(FLUID_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        nvs_set_u8(h, "style", (uint8_t)s_settings.style);
+        nvs_set_u8(h, "palette", (uint8_t)s_settings.palette);
+        nvs_set_u8(h, "clock", s_settings.clock);
+        nvs_set_u8(h, "bright", (uint8_t)s_settings.brightness);
+        nvs_set_u8(h, "rainbow", s_settings.rainbow_unlocked);
+        err = nvs_commit(h);
+        nvs_close(h);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Settings not saved: %s", esp_err_to_name(err));
+    }
+}
+
+// The rainbow's hue follows the foam level, which needs a lower speed scale.
+static void apply_palette(int palette)
+{
+    float speed = palette == FLUID_PALETTE_RAINBOW ? FLUID_RAINBOW_FOAM_SPEED : s_foam_speed_default;
+    s_raster_led.foam_speed = speed;
+    s_raster_fine.foam_speed = speed;
+}
+
+// Clock digits as fluid walls, rebuilt when the minute changes (or on `force`).
+static void update_clock(bool force)
+{
+    if (!s_settings.clock) {
+        if (s_walls_on) {
+            fluid_set_walls(s_fluid, NULL, NULL);
+            s_walls_on = false;
+        }
+        return;
+    }
+    time_t now = time(NULL);
+    int64_t minute = (int64_t)now / 60;
+    if (!force && s_walls_on && minute == s_clock_minute) {
+        return;
+    }
+    struct tm tm;
+    localtime_r(&now, &tm);
+    int64_t t0 = esp_timer_get_time();
+    fluid_clock_set(&s_clock, tm.tm_hour, tm.tm_min);
+    fluid_set_walls(s_fluid, fluid_clock_sdf, &s_clock);
+    s_walls_on = true;
+    s_clock_minute = minute;
+    ESP_LOGI(TAG, "Clock %02d:%02d (walls in %" PRId64 " us)", tm.tm_hour, tm.tm_min, esp_timer_get_time() - t0);
+}
+
+// Rising edges above FLUID_SHAKE_G, at least FLUID_SHAKE_GAP_US apart; true on the
+// FLUID_SHAKE_PEAKS-th within the window.
+static bool detect_shake(int64_t now, float ax, float ay)
+{
+    static bool above;
+    static int peaks;
+    static int64_t first_at;
+    static int64_t last_at;
+    static int64_t cooldown_until;
+
+    float m2 = ax * ax + ay * ay;
+    float on = FLUID_SHAKE_G * FLUID_SHAKE_G;
+    float off = 0.64f * on; // release at 0.8 x threshold
+    bool rising = !above && m2 > on;
+    above = above ? m2 > off : m2 > on;
+    if (!rising || now < cooldown_until || now - last_at < FLUID_SHAKE_GAP_US) {
+        return false;
+    }
+    if (peaks == 0 || now - first_at > FLUID_SHAKE_WINDOW_US) {
+        peaks = 0;
+        first_at = now;
+    }
+    peaks++;
+    last_at = now;
+    ESP_LOGI(TAG, "Shake peak %d/%d (%.1f g)", peaks, FLUID_SHAKE_PEAKS, sqrtf(m2));
+    if (peaks < FLUID_SHAKE_PEAKS) {
+        return false;
+    }
+    peaks = 0;
+    cooldown_until = now + FLUID_SHAKE_COOLDOWN_US;
+    return true;
+}
+
+static bool menu_close_requested(void)
+{
+    return atomic_load(&s_menu_close_request);
+}
+
+// Sim task side of the menu: hand over to the render task, keep reading the buttons
+// (PWR or BOOT close it), then apply what changed.
+static void run_menu(void)
+{
+    fluid_settings_t before = s_settings;
+    atomic_store(&s_menu_close_request, false);
+    atomic_store(&s_menu_open, true);
+    xTaskNotifyGive(s_render_task);
+    ESP_LOGI(TAG, "Menu open");
+
+    while (atomic_load(&s_menu_open)) {
+        vTaskDelay(pdMS_TO_TICKS(FLUID_MENU_POLL_MS));
+        int64_t now = esp_timer_get_time();
+        bool boot_short = false;
+        bool boot_long = false;
+        bool pwr = false;
+        poll_boot(now, &boot_short, &boot_long);
+        if (watch_pwr_key_is_available()) {
+            watch_pwr_key_take_short_press(&pwr);
+        }
+        if (boot_short || pwr) {
+            atomic_store(&s_menu_close_request, true);
+        }
+    }
+
+    const fluid_menu_result_t *r = &s_menu_result;
+    if (s_settings.style != before.style) {
+        fluid_raster_clear(raster_for((fluid_style_t)s_settings.style));
+    }
+    apply_palette(s_settings.palette);
+    if (r->reset_fluid) {
+        fluid_reset(s_fluid);
+    }
+    update_clock(r->time_changed || s_settings.clock != before.clock);
+    if (memcmp(&before, &s_settings, sizeof(before)) != 0) {
+        settings_save();
+    }
+    ESP_LOGI(TAG, "Menu closed: style=%s palette=%s clock=%d brightness=%d%s",
+             fluid_style_name((fluid_style_t)s_settings.style), fluid_palette_name(s_settings.palette),
+             s_settings.clock, s_settings.brightness, r->reset_fluid ? " reset" : "");
+}
+
 static void sim_task(void *arg)
 {
     (void)arg;
@@ -310,8 +501,11 @@ static void sim_task(void *arg)
     }
 
     const float g_scale = (float)CONFIG_FLUID_GRAVITY_PX_PER_G;
-    fluid_style_t style = FLUID_STYLE_LED;
-    int palette = 0;
+    apply_palette(s_settings.palette);
+    update_clock(true);
+    float g_low_x = 0.0f; // slow gravity estimate, for the splash direction
+    float g_low_y = 1.0f;
+    int64_t pwr_poll_at = 0;
     uint32_t frame = 0;
     int64_t next_us = esp_timer_get_time();
     int64_t last_step_us = next_us - 1000000 / FLUID_FPS;
@@ -339,18 +533,43 @@ static void sim_task(void *arg)
         dt = dt < FLUID_DT_MIN ? FLUID_DT_MIN : (dt > FLUID_DT_MAX ? FLUID_DT_MAX : dt);
         last_step_us = t0;
 
+        // PWR opens the menu (core convention: PWR = back/menu). The simulation
+        // pauses until it closes; the clocks restart so the pause is not a dt jump.
+        if (t0 >= pwr_poll_at && watch_pwr_key_is_available()) {
+            pwr_poll_at = t0 + FLUID_PWR_POLL_US;
+            bool pwr = false;
+            watch_pwr_key_take_short_press(&pwr);
+            if (pwr) {
+                run_menu();
+                t0 = esp_timer_get_time();
+                last_step_us = t0 - 1000000 / FLUID_FPS;
+                next_us = t0;
+                last_log = t0;
+                frames = overruns = imu_errors = touch_errors = sim_max = 0;
+                input_total = sim_total = raster_total = dt_total = 0;
+                memset(stage, 0, sizeof(stage));
+                continue;
+            }
+        }
+
+        // BOOT shortcuts: short = style, long = palette.
         bool short_press = false;
         bool long_press = false;
         poll_boot(t0, &short_press, &long_press);
-        if (short_press) {
-            style = (fluid_style_t)((style + 1) % FLUID_STYLE_COUNT);
-            fluid_raster_clear(raster_for(style));
-            ESP_LOGI(TAG, "Style: %s", fluid_style_name(style));
+        if (short_press || long_press) {
+            if (short_press) {
+                s_settings.style = (s_settings.style + 1) % FLUID_STYLE_COUNT;
+                fluid_raster_clear(raster_for((fluid_style_t)s_settings.style));
+                ESP_LOGI(TAG, "Style: %s", fluid_style_name((fluid_style_t)s_settings.style));
+            } else {
+                int palettes = s_settings.rainbow_unlocked ? FLUID_PALETTE_COUNT : FLUID_PALETTE_RAINBOW;
+                s_settings.palette = (s_settings.palette + 1) % palettes;
+                apply_palette(s_settings.palette);
+                ESP_LOGI(TAG, "Palette: %s", fluid_palette_name(s_settings.palette));
+            }
+            settings_save();
         }
-        if (long_press) {
-            palette = (palette + 1) % FLUID_PALETTE_COUNT;
-            ESP_LOGI(TAG, "Palette: %s", fluid_palette_name(palette));
-        }
+        update_clock(false);
 
         // Absolute gravity: imu_service is never calibrated, so its bias stays 0 and it
         // reports the real gravity projected on the screen (plus any shaking).
@@ -361,6 +580,22 @@ static void sim_task(void *arg)
             if (imu_service_read(&accel) == ESP_OK) {
                 gx = accel.x * g_scale;
                 gy = accel.y * g_scale;
+                g_low_x += 0.05f * (accel.x - g_low_x);
+                g_low_y += 0.05f * (accel.y - g_low_y);
+                if (detect_shake(t0, accel.x, accel.y)) {
+                    // Easter egg: splash against gravity and unlock the rainbow palette.
+                    float len2 = g_low_x * g_low_x + g_low_y * g_low_y;
+                    float inv = len2 > 0.01f ? 1.0f / sqrtf(len2) : 0.0f;
+                    fluid_splash(s_fluid, inv > 0.0f ? -g_low_x * inv : 0.0f, inv > 0.0f ? -g_low_y * inv : -1.0f,
+                                 FLUID_SPLASH_SPEED);
+                    ESP_LOGI(TAG, "Easter egg!%s", s_settings.rainbow_unlocked ? "" : " Rainbow palette unlocked");
+                    if (!s_settings.rainbow_unlocked) {
+                        s_settings.rainbow_unlocked = true;
+                        s_settings.palette = FLUID_PALETTE_RAINBOW;
+                        apply_palette(s_settings.palette);
+                        settings_save();
+                    }
+                }
             } else {
                 imu_errors++;
             }
@@ -372,9 +607,10 @@ static void sim_task(void *arg)
         int64_t t1 = esp_timer_get_time();
 
         fluid_frame_t *out = &s_frames[s_write];
+        fluid_style_t style = (fluid_style_t)s_settings.style;
         fluid_raster_run(raster_for(style), s_fluid, out->level, out->foam);
         out->style = style;
-        out->palette = palette;
+        out->palette = s_settings.palette;
         int64_t t2 = esp_timer_get_time();
 
         portENTER_CRITICAL(&s_frame_lock);
@@ -440,6 +676,61 @@ static void sim_task(void *arg)
     }
 }
 
+// Full frame of the last fluid image, dimmed and in native byte order, as the menu
+// background. Uses the renderer's current configuration.
+static const uint16_t *make_snapshot(const fluid_frame_t *fr)
+{
+    if (s_snapshot == NULL) {
+        s_snapshot = heap_caps_malloc((size_t)FLUID_W * FLUID_H * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+        if (s_snapshot == NULL) {
+            ESP_LOGW(TAG, "No memory for the menu background");
+            return NULL;
+        }
+    }
+    s_render.full_redraw = true;
+    fluid_render_prepare(&s_render, fr->level, fr->foam);
+    for (int y = 0; y < FLUID_H; y += FLUID_BAND_LINES) {
+        int lines = FLUID_H - y < FLUID_BAND_LINES ? FLUID_H - y : FLUID_BAND_LINES;
+        fluid_render_band(&s_render, y, lines, 0, FLUID_W - 1, s_snapshot + y * FLUID_W);
+    }
+    for (int i = 0; i < FLUID_W * FLUID_H; i++) {
+        uint16_t v = s_snapshot[i];
+        v = (uint16_t)((v >> 8) | (v << 8));
+        uint16_t r = (uint16_t)(((v >> 11) * 3) >> 3); // 3/8 brightness
+        uint16_t g = (uint16_t)((((v >> 5) & 63) * 3) >> 3);
+        uint16_t b = (uint16_t)(((v & 31) * 3) >> 3);
+        s_snapshot[i] = (uint16_t)((r << 11) | (g << 5) | b);
+    }
+    return s_snapshot;
+}
+
+// Runs the menu in this task, so LVGL and the fluid renderer never share the panel.
+static void render_menu(const fluid_frame_t *fr)
+{
+    static bool menu_ready;
+    if (!menu_ready) {
+        const fluid_menu_config_t cfg = {
+            .panel = s_panel,
+            .touch = s_touch,
+            .bufs = {s_dma[0], s_dma[1]},
+            .buf_lines = FLUID_BAND_LINES,
+            .width = FLUID_W,
+            .height = FLUID_H,
+            .style_count = FLUID_STYLE_COUNT,
+        };
+        esp_err_t err = fluid_menu_init(&cfg);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Menu init failed: %s", esp_err_to_name(err));
+        }
+        menu_ready = err == ESP_OK;
+    }
+    const uint16_t *bg = fr != NULL ? make_snapshot(fr) : NULL;
+    fluid_menu_run(&s_settings, bg, menu_close_requested, &s_menu_result);
+    vTaskDelay(pdMS_TO_TICKS(5)); // let the last LVGL band leave the DMA buffer
+    s_render.full_redraw = true;
+    atomic_store(&s_menu_open, false);
+}
+
 static void render_task(void *arg)
 {
     (void)arg;
@@ -455,8 +746,17 @@ static void render_task(void *arg)
     uint64_t compute_total = 0;
     int64_t last_log = esp_timer_get_time();
 
+    bool drawn = false; // s_frames[s_read] holds a frame
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (atomic_load(&s_menu_open)) {
+            render_menu(drawn ? &s_frames[s_read] : NULL);
+            style = FLUID_STYLE_COUNT; // reconfigure: the menu may have changed it
+            last_log = esp_timer_get_time();
+            frames = errors = render_max = bytes_max = 0;
+            render_total = bytes_total = compute_total = 0;
+            continue;
+        }
         bool got = false;
         portENTER_CRITICAL(&s_frame_lock);
         if (s_fresh) {
@@ -472,6 +772,7 @@ static void render_task(void *arg)
         }
 
         const fluid_frame_t *fr = &s_frames[s_read];
+        drawn = true;
         if (fr->style != style || fr->palette != palette) {
             style = fr->style;
             palette = fr->palette;
@@ -533,8 +834,22 @@ static void render_task(void *arg)
     }
 }
 
+static void init_nvs(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        err = nvs_flash_init();
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS unavailable (%s); settings will not persist", esp_err_to_name(err));
+    }
+}
+
 esp_err_t fluid_app_start(void)
 {
+    init_nvs();
+    settings_load();
     esp_err_t err = init_display();
     if (err != ESP_OK) {
         return err;
@@ -552,6 +867,18 @@ esp_err_t fluid_app_start(void)
     err = watch_boot_button_init();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "BOOT button unavailable: %s", esp_err_to_name(err));
+    }
+    err = watch_pwr_key_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "PWR key unavailable (%s); no menu", esp_err_to_name(err));
+    }
+#if CONFIG_FLUID_RTC_SET_FROM_BUILD
+    err = watch_rtc_init(true);
+#else
+    err = watch_rtc_init(false);
+#endif
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "RTC unavailable (%s); the clock starts at 00:00", esp_err_to_name(err));
     }
 
     err = init_engine();

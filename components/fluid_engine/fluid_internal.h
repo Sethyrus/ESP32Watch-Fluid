@@ -63,7 +63,7 @@ struct fluid {
     float *prev_u;
     float *prev_v;
     float *s;        // 1 = open, 0 = solid (container mask + obstacle)
-    float *s_static; // container mask only
+    float *s_static; // container mask plus walls
     float *density;  // particle density per cell
     uint8_t *cell_type;
     uint16_t *fluid_list;     // interior FLUID cells, rebuilt every substep
@@ -92,6 +92,19 @@ struct fluid {
     float obstacle_r;
     float obstacle_vx;
     float obstacle_vy;
+
+    // Static walls (fluid_set_walls), screen coordinates: signed distance sampled every
+    // wall_step px, in 1/4 px, clamped to int8. Only the band near a wall matters.
+    int8_t *wall;
+    int wnx;
+    int wny;
+    float wall_step;
+    float inv_wall_step;
+    bool walls_active;
+    uint32_t walls_version;
+    int wall_grow_steps; // steps left with a limited push (after the walls changed)
+
+    uint32_t rng; // fluid_splash
 
     fluid_stats_t stats;
 };

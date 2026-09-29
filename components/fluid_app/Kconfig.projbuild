@@ -38,5 +38,21 @@ menu "Fluid simulation"
         int "Display brightness (%)"
         range 10 100
         default 80
+        help
+            Initial value; the menu (PWR) changes it and saves it in NVS.
+
+    config FLUID_CLOCK_DEFAULT
+        bool "Show the clock digits by default"
+        default y
+        help
+            The hour and minutes become walls the fluid flows around. Toggle in
+            the menu (PWR); the choice is saved in NVS.
+
+    config FLUID_RTC_SET_FROM_BUILD
+        bool "Set the RTC to the build time on every boot"
+        default n
+        help
+            Off: the build time is only written when the RTC lost its time
+            (battery out). The time can also be set from the menu.
 
 endmenu

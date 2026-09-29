@@ -28,6 +28,8 @@ typedef struct {
     uint16_t *acc_speed;
     uint16_t *row_tmp;
     uint8_t *state;
+    uint8_t *wall;          // 1 = cell centre inside a wall (fluid_set_walls)
+    uint32_t walls_version; // of the fluid when `wall` was built
 } fluid_raster_t;
 
 // Allocates buffers for a pitch; returns false on allocation failure.
@@ -36,7 +38,9 @@ bool fluid_raster_init(fluid_raster_t *raster, int screen_w, int screen_h, int p
 // Forget the temporal state (call after switching styles or resetting the fluid).
 void fluid_raster_clear(fluid_raster_t *raster);
 
-// level: 0..255 fill per cell; foam: 0..3. Both cols * rows, row-major.
+// level: 0..255 fill per cell; foam: 0..3, or FLUID_RASTER_WALL (level 0) on a wall.
+// Both cols * rows, row-major.
+#define FLUID_RASTER_WALL 4
 void fluid_raster_run(fluid_raster_t *raster, const fluid_t *fluid, uint8_t *level, uint8_t *foam);
 
 #ifdef __cplusplus

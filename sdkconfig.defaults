@@ -36,5 +36,12 @@ CONFIG_BSP_SD_MOUNT_POINT="/sdcard"
 CONFIG_BSP_LCD_RGB_BOUNCE_BUFFER_HEIGHT=20
 CONFIG_BSP_I2S_NUM=1
 
-# LVGL is linked through the BSP but never started: the app draws straight to the
-# panel (components/fluid_app). No LVGL options are needed.
+# LVGL only runs for the settings menu (components/fluid_app/fluid_menu.c), inside
+# the render task: no LVGL OS layer. Its allocator (fluid_app/lv_mem_core_psram.c)
+# uses PSRAM, keeping internal RAM for the simulation.
+CONFIG_LV_USE_CUSTOM_MALLOC=y
+CONFIG_LV_USE_CLIB_STRING=y
+CONFIG_LV_USE_CLIB_SPRINTF=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+CONFIG_LV_BUILD_EXAMPLES=n

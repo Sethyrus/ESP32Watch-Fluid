@@ -9,7 +9,7 @@ BUILD="${BUILD_DIR:-$HERE/build}"
 mkdir -p "$BUILD"
 cc -std=c11 -O2 ${CFLAGS_EXTRA:-} -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L \
     -I"$ENGINE/include" -I"$ENGINE" \
-    "$HERE/bench.c" "$ENGINE/fluid_sim.c" "$ENGINE/fluid_raster.c" "$ENGINE/fluid_render.c" \
+    "$HERE/bench.c" "$ENGINE/fluid_sim.c" "$ENGINE/fluid_raster.c" "$ENGINE/fluid_render.c" "$ENGINE/fluid_clock.c" \
     -lm -lpthread -o "$BUILD/fluid_bench"
 cd "$BUILD"
 exec ./fluid_bench "$@"

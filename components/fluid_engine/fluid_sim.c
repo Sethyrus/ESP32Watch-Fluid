@@ -117,6 +117,50 @@ float fluid_container_sdf(const fluid_t *f, float x, float y)
     return container_sdf(&f->cfg, x, y, NULL, NULL);
 }
 
+// Bilinear wall distance (screen px) and its gradient direction, from the int8 field.
+static inline float wall_eval(const fluid_t *f, float x, float y, float *gx, float *gy)
+{
+    float fx = clampf(x * f->inv_wall_step, 0.0f, (float)(f->wnx - 1) - 0.001f);
+    float fy = clampf(y * f->inv_wall_step, 0.0f, (float)(f->wny - 1) - 0.001f);
+    int i = (int)fx;
+    int j = (int)fy;
+    float tx = fx - (float)i;
+    float ty = fy - (float)j;
+    const int8_t *w = f->wall + j * f->wnx + i;
+    float v00 = (float)w[0];
+    float v10 = (float)w[1];
+    float v01 = (float)w[f->wnx];
+    float v11 = (float)w[f->wnx + 1];
+    if (gx != NULL) {
+        *gx = (v10 - v00) * (1.0f - ty) + (v11 - v01) * ty;
+        *gy = (v01 - v00) * (1.0f - tx) + (v11 - v10) * tx;
+    }
+    float top = v00 + (v10 - v00) * tx;
+    float bot = v01 + (v11 - v01) * tx;
+    return 0.25f * (top + (bot - top) * ty);
+}
+
+// Open cells: centre inside the rounded rect and outside every wall.
+static void build_static_mask(fluid_t *f)
+{
+    for (int i = 0; i < f->nx; i++) {
+        for (int j = 0; j < f->ny; j++) {
+            float open = 0.0f;
+            if (i > 0 && j > 0 && i < f->nx - 1 && j < f->ny - 1) {
+                float cx = ((float)i + 0.5f) * f->h - f->h;
+                float cy = ((float)j + 0.5f) * f->h - f->h;
+                bool inside = container_sdf(&f->cfg, cx, cy, NULL, NULL) < 0.0f;
+                if (inside && f->walls_active) {
+                    inside = wall_eval(f, cx, cy, NULL, NULL) >= 0.0f;
+                }
+                open = inside ? 1.0f : 0.0f;
+            }
+            f->s_static[i * f->ny + j] = open;
+            f->s[i * f->ny + j] = open;
+        }
+    }
+}
+
 fluid_t *fluid_create(const fluid_config_t *config)
 {
     fluid_t tmp = {.cfg = *config};
@@ -157,26 +201,23 @@ fluid_t *fluid_create(const fluid_config_t *config)
     f->vel = zalloc(f, parts * 2 * sizeof(float));
     f->cell_count = zalloc(f, ((size_t)f->pnx * f->pny + 1) * sizeof(int32_t));
     f->cell_ids = zalloc(f, parts * sizeof(uint16_t));
+    f->wall_step = 0.5f * f->h;
+    f->inv_wall_step = 1.0f / f->wall_step;
+    f->wnx = (int)ceilf(config->width * f->inv_wall_step) + 1;
+    f->wny = (int)ceilf(config->height * f->inv_wall_step) + 1;
+    f->wall = zalloc(f, (size_t)f->wnx * f->wny);
 
     if (!f->u || !f->v || !f->du || !f->dv || !f->prev_u || !f->prev_v || !f->s || !f->s_static ||
         !f->density || !f->cell_type || !f->fluid_list || !f->inv_s_sum || !f->pos || !f->vel ||
-        !f->cell_count || !f->cell_ids || f->num_cells > 65535 || f->capacity > 65535) {
+        !f->cell_count || !f->cell_ids || !f->wall || f->num_cells > 65535 || f->capacity > 65535) {
         return NULL; // buffers are not freed: this only happens at boot with a bad config
     }
 
-    // Container mask: a cell is open when its centre lies inside the rounded rect.
-    for (int i = 0; i < f->nx; i++) {
-        for (int j = 0; j < f->ny; j++) {
-            float open = 0.0f;
-            if (i > 0 && j > 0 && i < f->nx - 1 && j < f->ny - 1) {
-                float cx = ((float)i + 0.5f) * f->h - f->h;
-                float cy = ((float)j + 0.5f) * f->h - f->h;
-                open = container_sdf(&f->cfg, cx, cy, NULL, NULL) < 0.0f ? 1.0f : 0.0f;
-            }
-            f->s_static[i * f->ny + j] = open;
-            f->s[i * f->ny + j] = open;
-        }
+    for (int i = 0; i < f->wnx * f->wny; i++) {
+        f->wall[i] = INT8_MAX;
     }
+    f->rng = 0x9e3779b9u;
+    build_static_mask(f);
 
     fluid_reset(f);
     return f;
@@ -195,7 +236,8 @@ void fluid_reset(fluid_t *f)
     for (float y = c->height - r - 0.5f; y > r && n < target; y -= dy, row++) {
         float x0 = r + 0.5f + ((row & 1) ? r : 0.0f);
         for (float x = x0; x < c->width - r && n < target; x += dx) {
-            if (container_sdf(c, x, y, NULL, NULL) > -r) {
+            if (container_sdf(c, x, y, NULL, NULL) > -r ||
+                (f->walls_active && wall_eval(f, x, y, NULL, NULL) < r)) {
                 continue;
             }
             f->pos[2 * n] = x + f->h;
@@ -223,6 +265,50 @@ void fluid_set_obstacle(fluid_t *f, float x, float y, float radius, float vx, fl
     f->obstacle_r = radius;
     f->obstacle_vx = vx;
     f->obstacle_vy = vy;
+}
+
+void fluid_set_walls(fluid_t *f, fluid_sdf_fn sdf, void *ctx)
+{
+    f->walls_active = sdf != NULL;
+    for (int j = 0; j < f->wny; j++) {
+        for (int i = 0; i < f->wnx; i++) {
+            float d = sdf != NULL ? 4.0f * sdf(ctx, (float)i * f->wall_step, (float)j * f->wall_step) : 127.0f;
+            d = clampf(d, -127.0f, 127.0f);
+            f->wall[j * f->wnx + i] = (int8_t)(d < 0.0f ? d - 0.5f : d + 0.5f);
+        }
+    }
+    build_static_mask(f);
+    f->walls_version++;
+    f->wall_grow_steps = 20;
+}
+
+uint32_t fluid_walls_version(const fluid_t *f)
+{
+    return f->walls_version;
+}
+
+float fluid_wall_sdf(const fluid_t *f, float x, float y)
+{
+    return f->walls_active ? wall_eval(f, x, y, NULL, NULL) : 1e6f;
+}
+
+static inline float rand01(uint32_t *x)
+{
+    *x = *x * 1664525u + 1013904223u; // LCG
+    return (float)(*x >> 8) * (1.0f / 16777216.0f);
+}
+
+void fluid_splash(fluid_t *f, float dir_x, float dir_y, float speed)
+{
+    // Random pure noise would mostly be projected away by the pressure solve; a
+    // coherent throw along dir, uneven per particle, breaks the surface instead.
+    uint32_t x = f->rng;
+    for (int i = 0; i < f->num_particles; i++) {
+        float k = speed * (0.4f + 0.6f * rand01(&x));
+        f->vel[2 * i] += dir_x * k + 0.3f * speed * (rand01(&x) - 0.5f);
+        f->vel[2 * i + 1] += dir_y * k + 0.3f * speed * (rand01(&x) - 0.5f);
+    }
+    f->rng = x;
 }
 
 static void apply_obstacle_to_grid(fluid_t *f)
@@ -448,6 +534,9 @@ static void collide_job(void *ctx, int part)
     float ob_r2 = ob_r * ob_r;
     float cx = 0.5f * f->cfg.width + h;
     float cy = 0.5f * f->cfg.height + h;
+    // Right after fluid_set_walls the push is limited, so a new wall shoves the fluid
+    // aside over a few steps instead of flinging it; afterwards it is a plain wall.
+    float max_push = f->wall_grow_steps > 0 ? 0.5f * h : 1e9f;
     int i0;
     int i1;
     particle_range(f, part, &i0, &i1);
@@ -477,6 +566,28 @@ static void collide_job(void *ctx, int part)
                 y = f->obstacle_y + ny * ob_r;
                 vx = f->obstacle_vx;
                 vy = f->obstacle_vy;
+            }
+        }
+
+        if (f->walls_active) {
+            float gx;
+            float gy;
+            float wd = wall_eval(f, x - h, y - h, &gx, &gy);
+            if (wd < r) {
+                // Out along the gradient.
+                float g2 = gx * gx + gy * gy;
+                float inv = g2 > 1e-6f ? fluid_rsqrt(g2) : 0.0f;
+                float wx = gx * inv;
+                float wy = g2 > 1e-6f ? gy * inv : -1.0f;
+                float pen = r - wd;
+                pen = pen > max_push ? max_push : pen;
+                x += wx * pen;
+                y += wy * pen;
+                float vn = vx * wx + vy * wy;
+                if (vn < 0.0f) {
+                    vx -= vn * wx;
+                    vy -= vn * wy;
+                }
             }
         }
 
@@ -556,14 +667,19 @@ static void p2g_job(void *ctx, int comp)
         }
     }
 
-    // Faces touching solid cells keep their previous (wall / obstacle) velocity.
+    // Faces touching solid cells: 0 against static walls (container, fluid_set_walls),
+    // else the previous value, which is the obstacle velocity. Keeping the previous
+    // value at static walls too would freeze whatever velocity a face had when its
+    // wall appeared (or the finger left it) and keep pumping it into the fluid.
+    const float *restrict ss = f->s_static;
     int step = comp == 0 ? n : 1;
     for (int i = 0; i < nx; i++) {
         for (int j = 0; j < n; j++) {
             int c = i * n + j;
             bool has_prev = comp == 0 ? i > 0 : j > 0;
             if (ct[c] == FLUID_CELL_SOLID || (has_prev && ct[c - step] == FLUID_CELL_SOLID)) {
-                fg[c] = prev[c];
+                bool wall = ss[c] == 0.0f || (has_prev && ss[c - step] == 0.0f);
+                fg[c] = wall ? 0.0f : prev[c];
             }
         }
     }
@@ -843,6 +959,9 @@ void fluid_step(fluid_t *f, float gx, float gy, float dt, int substeps)
         }
         st->us_separate += elapsed(f, &t);
         run2(f, collide_job, f);
+        if (f->wall_grow_steps > 0) {
+            f->wall_grow_steps--;
+        }
         st->us_collide += elapsed(f, &t);
         apply_obstacle_to_grid(f);
         particles_to_grid(f);

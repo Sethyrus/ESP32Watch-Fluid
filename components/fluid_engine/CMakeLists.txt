@@ -4,5 +4,6 @@ idf_component_register(
         "fluid_sim.c"
         "fluid_raster.c"
         "fluid_render.c"
+        "fluid_clock.c"
     INCLUDE_DIRS "include"
 )

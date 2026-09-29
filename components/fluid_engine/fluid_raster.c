@@ -33,7 +33,8 @@ bool fluid_raster_init(fluid_raster_t *r, int screen_w, int screen_h, int pitch,
     r->acc_speed = zalloc(alloc, cells * sizeof(uint16_t));
     r->row_tmp = zalloc(alloc, (size_t)r->cols * sizeof(uint16_t));
     r->state = zalloc(alloc, cells);
-    return r->acc_density && r->acc_speed && r->row_tmp && r->state;
+    r->wall = zalloc(alloc, cells);
+    return r->acc_density && r->acc_speed && r->row_tmp && r->state && r->wall;
 }
 
 void fluid_raster_clear(fluid_raster_t *r)
@@ -80,9 +81,27 @@ static void blur(fluid_raster_t *r, uint16_t *a)
     }
 }
 
+// Wall cells, rebuilt only when the fluid's walls change.
+static void update_walls(fluid_raster_t *r, const fluid_t *f)
+{
+    uint32_t version = fluid_walls_version(f);
+    if (version == r->walls_version) {
+        return;
+    }
+    r->walls_version = version;
+    for (int row = 0; row < r->rows; row++) {
+        float y = (float)(r->off_y + row * r->pitch) + 0.5f * (float)r->pitch;
+        for (int c = 0; c < r->cols; c++) {
+            float x = (float)(r->off_x + c * r->pitch) + 0.5f * (float)r->pitch;
+            r->wall[row * r->cols + c] = fluid_wall_sdf(f, x, y) < 0.0f;
+        }
+    }
+}
+
 void fluid_raster_run(fluid_raster_t *r, const fluid_t *f, uint8_t *level, uint8_t *foam)
 {
     size_t cells = (size_t)r->cols * (size_t)r->rows;
+    update_walls(r, f);
     memset(r->acc_density, 0, cells * sizeof(uint16_t));
     memset(r->acc_speed, 0, cells * sizeof(uint16_t));
 
@@ -134,5 +153,13 @@ void fluid_raster_run(fluid_raster_t *r, const fluid_t *f, uint8_t *level, uint8
         int st = (r->state[i] * keep + l * take + 128) >> 8;
         r->state[i] = (uint8_t)st;
         level[i] = (uint8_t)st;
+    }
+    if (r->walls_version != 0) {
+        for (size_t i = 0; i < cells; i++) {
+            if (r->wall[i]) {
+                level[i] = 0;
+                foam[i] = FLUID_RASTER_WALL;
+            }
+        }
     }
 }

@@ -2,6 +2,8 @@
 // Runs a scripted scenario (settle, rotate, shake, zero-g, finger sweep), checks the
 // particles stay valid, measures per-stage cost and the bytes each style would send
 // to the panel, and dumps PPM frames. See run.sh.
+// --clock HHMM adds the clock digits as walls (the minute advances at t=15 s),
+// --splash T fires the easter-egg splash at T seconds, --palette N picks the colours.
 
 #include <math.h>
 #include <pthread.h>
@@ -11,6 +13,7 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#include "fluid_clock.h"
 #include "fluid_raster.h"
 #include "fluid_render.h"
 #include "fluid_sim.h"
@@ -154,6 +157,9 @@ int main(int argc, char **argv)
     float gravity = 1800.0f;
     double seconds = 22.0;
     const char *out = "out";
+    int clock_hhmm = -1;
+    double splash_at = -1.0;
+    int palette = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--threads")) {
@@ -178,6 +184,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--seconds")) seconds = atof(argv[i + 1]);
         else if (!strcmp(argv[i], "--max-particles")) cfg.max_particles = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "--out")) out = argv[i + 1];
+        else if (!strcmp(argv[i], "--clock")) clock_hhmm = atoi(argv[i + 1]);
+        else if (!strcmp(argv[i], "--splash")) splash_at = atof(argv[i + 1]);
+        else if (!strcmp(argv[i], "--palette")) palette = atoi(argv[i + 1]) % FLUID_PALETTE_COUNT;
         else {
             fprintf(stderr, "unknown option %s\n", argv[i]);
             return 2;
@@ -190,6 +199,17 @@ int main(int argc, char **argv)
     if (f == NULL) {
         fprintf(stderr, "FAIL: fluid_create\n");
         return 1;
+    }
+    fluid_clock_t clock;
+    fluid_clock_init(&clock, W, H);
+    int clock_min = clock_hhmm / 100 * 60 + clock_hhmm % 100;
+    double walls_changed_at = 0.0;
+    if (clock_hhmm >= 0) {
+        fluid_clock_set(&clock, clock_min / 60 % 24, clock_min % 60);
+        int64_t w0 = now_us();
+        fluid_set_walls(f, fluid_clock_sdf, &clock);
+        printf("walls: %04d, sampled in %lld us (host)\n", clock_hhmm, (long long)(now_us() - w0));
+        fluid_reset(f);
     }
     const fluid_stats_t *st = fluid_get_stats(f);
     int np0 = fluid_particle_count(f);
@@ -205,16 +225,19 @@ int main(int argc, char **argv)
         int p = fluid_style_pitch((fluid_style_t)s);
         if (!fluid_raster_init(&c->raster, W, H, p, NULL)) return 1;
         c->raster.blur = s != FLUID_STYLE_LED;
+        if (palette == FLUID_PALETTE_RAINBOW) {
+            c->raster.foam_speed = FLUID_RAINBOW_FOAM_SPEED;
+        }
         int cells = c->raster.cols * c->raster.rows;
         if (!fluid_render_init(&c->render, W, H, cells, p, false, NULL)) return 1;
-        fluid_render_configure(&c->render, (fluid_style_t)s, 0, &c->raster);
+        fluid_render_configure(&c->render, (fluid_style_t)s, palette, &c->raster);
         c->level = calloc((size_t)cells, 1);
         c->foam = calloc((size_t)cells, 1);
         c->band = calloc((size_t)W * BAND, sizeof(uint16_t));
         c->frame = calloc((size_t)W * H, sizeof(uint16_t));
     }
 
-    const double dump_at[] = {2.9, 4.0, 5.0, 7.5, 9.5, 11.9, 13.0, 16.9, 19.9, 31.9};
+    const double dump_at[] = {2.9, 4.0, 5.0, 7.5, 9.5, 11.9, 13.0, 15.1, 15.5, 16.9, 18.1, 18.3, 19.9, 31.9};
     const int ndump = (int)(sizeof(dump_at) / sizeof(dump_at[0]));
     int next_dump = 0;
     double sum_stage[7] = {0};
@@ -223,6 +246,7 @@ int main(int argc, char **argv)
     int frames = (int)(seconds * FPS);
     float dt = 1.0f / FPS;
     int fail = 0;
+    int in_wall_max = 0;
 
     for (int k = 0; k < frames; k++) {
         double t = (double)k / FPS;
@@ -234,6 +258,15 @@ int main(int argc, char **argv)
         float fvx;
         scenario(t, &gx, &gy, &finger, &fx, &fy, &fvx);
         fluid_set_obstacle(f, fx, fy, 28.0f, fvx, 0.0f, finger != 0);
+        if (clock_hhmm >= 0 && k == 15 * FPS) {
+            clock_min++;
+            fluid_clock_set(&clock, clock_min / 60 % 24, clock_min % 60);
+            fluid_set_walls(f, fluid_clock_sdf, &clock);
+            walls_changed_at = t;
+        }
+        if (splash_at >= 0.0 && k == (int)(splash_at * FPS)) {
+            fluid_splash(f, 0.0f, -1.0f, 1400.0f); // against gravity (scenario: +y)
+        }
 
         int64_t t0 = now_us();
         fluid_step(f, gx * gravity, gy * gravity, dt, substeps);
@@ -254,6 +287,7 @@ int main(int argc, char **argv)
         const float *vel = fluid_particle_velocities(f);
         float off = fluid_screen_offset(f);
         int bad = 0;
+        int in_wall = 0;
         double ke = 0.0;
         for (int i = 0; i < np; i++) {
             float x = pos[2 * i] - off;
@@ -262,7 +296,17 @@ int main(int argc, char **argv)
                 fluid_container_sdf(f, x, y) > 0.5f) {
                 bad++;
             }
+            if (fluid_wall_sdf(f, x, y) < -2.0f) { // field sampling error is ~1 px at caps
+                in_wall++;
+            }
             ke += 0.5 * ((double)vel[2 * i] * vel[2 * i] + (double)vel[2 * i + 1] * vel[2 * i + 1]);
+        }
+        if (in_wall > in_wall_max) in_wall_max = in_wall;
+        // A new wall may cover fluid; it has one second to push it out.
+        if (in_wall > 0 && t - walls_changed_at > 1.0) {
+            fprintf(stderr, "FAIL t=%.2f: %d particles inside walls\n", t, in_wall);
+            fail = 1;
+            break;
         }
         if (np != np0 || bad > 0) {
             fprintf(stderr, "FAIL t=%.2f: particles=%d/%d invalid=%d\n", t, np, np0, bad);
@@ -311,6 +355,9 @@ int main(int argc, char **argv)
                c->raster.pitch, c->raster.cols, c->raster.rows, c->us_raster / n, c->us_render / n,
                c->bytes / n / 1024.0, c->bytes_max / 1024.0, c->bytes / n / QSPI_BYTES_PER_S * 1000.0,
                c->bytes_max / QSPI_BYTES_PER_S * 1000.0, c->bytes_tail / FPS / 1024.0);
+    }
+    if (clock_hhmm >= 0) {
+        printf("\nparticles inside walls, max transient: %d\n", in_wall_max);
     }
     printf("\n%s\n", fail ? "RESULT: FAIL" : "RESULT: OK");
     return fail;

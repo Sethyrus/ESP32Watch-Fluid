@@ -20,7 +20,16 @@ typedef enum {
     FLUID_STYLE_COUNT,
 } fluid_style_t;
 
-#define FLUID_PALETTE_COUNT 3
+// The last palette is the hidden one (unlocked by the shake easter egg).
+#define FLUID_PALETTE_COUNT 4
+#define FLUID_PALETTE_RAINBOW 3
+// The rainbow's hue follows the foam level, so it wants a lower raster foam_speed
+// (px/s for full foam) than the default for the whole spectrum to show.
+#define FLUID_RAINBOW_FOAM_SPEED 450.0f
+
+// Tile styles: 16 levels x 4 foam, plus one tile for wall cells.
+#define FLUID_RENDER_WALL_CODE 64
+#define FLUID_RENDER_CODES 65
 
 typedef struct {
     int screen_w;
@@ -42,7 +51,10 @@ typedef struct {
     uint8_t *cur;   // visual codes, cols * rows
     uint8_t *prev;  // codes currently on screen
     uint8_t *shown; // level behind the code on screen, for hysteresis
-    uint16_t *tiles; // tile styles: 64 codes * pitch * pitch
+    uint16_t *tiles; // tile styles: FLUID_RENDER_CODES * pitch * pitch
+    uint8_t *wall;   // liquid: wall mask of the current frame
+    bool has_walls;
+    uint16_t wall_color; // liquid
     uint16_t *lut;   // liquid: 4 foam * 256 values
     int16_t *col_of_x;
     uint16_t *sub_x; // tile: offset in tile; liquid: weight 0..256

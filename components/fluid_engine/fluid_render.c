@@ -13,13 +13,16 @@ typedef struct {
     rgb_t deep;
     rgb_t bright;
     rgb_t foam;
-    rgb_t off; // unlit LED
+    rgb_t off;    // unlit LED
+    rgb_t wall;   // clock digits (fluid walls)
+    bool rainbow; // hue follows the speed (foam); deep/bright/foam unused
 } palette_t;
 
 static const palette_t s_palettes[FLUID_PALETTE_COUNT] = {
-    {"agua", {8, 60, 175}, {60, 170, 255}, {225, 248, 255}, {14, 16, 22}},
-    {"lava", {140, 18, 0}, {255, 105, 10}, {255, 232, 120}, {22, 14, 12}},
-    {"toxic", {0, 100, 45}, {70, 255, 120}, {225, 255, 210}, {12, 20, 14}},
+    {"agua", {8, 60, 175}, {60, 170, 255}, {225, 248, 255}, {14, 16, 22}, {70, 78, 96}, false},
+    {"lava", {140, 18, 0}, {255, 105, 10}, {255, 232, 120}, {22, 14, 12}, {96, 74, 66}, false},
+    {"toxic", {0, 100, 45}, {70, 255, 120}, {225, 255, 210}, {12, 20, 14}, {70, 92, 76}, false},
+    {"arcoiris", {0, 0, 0}, {0, 0, 0}, {255, 255, 255}, {18, 16, 22}, {88, 84, 100}, true},
 };
 
 static const struct {
@@ -87,9 +90,34 @@ static uint16_t to565(const fluid_render_t *r, rgb_t c)
     return r->swap_bytes ? (uint16_t)((v >> 8) | (v << 8)) : v;
 }
 
+// Fully saturated hue, h in 0..1 around the colour wheel.
+static rgb_t hue(float h)
+{
+    h = (h - floorf(h)) * 6.0f;
+    float x = h - floorf(h);
+    switch ((int)h) {
+    case 0: return (rgb_t){255, 255 * x, 0};
+    case 1: return (rgb_t){255 * (1 - x), 255, 0};
+    case 2: return (rgb_t){0, 255, 255 * x};
+    case 3: return (rgb_t){0, 255 * (1 - x), 255};
+    case 4: return (rgb_t){255 * x, 0, 255};
+    default: return (rgb_t){255, 0, 255 * (1 - x)};
+    }
+}
+
+// Rainbow: violet at rest, through blue, green and yellow to red as the fluid speeds
+// up (foam 0..3); thin fluid at the surface is shifted slightly towards blue.
+static rgb_t rainbow(float depth, int foam)
+{
+    return hue(0.74f - 0.22f * (float)foam - 0.08f * (1.0f - clamp01(depth)));
+}
+
 // Colour of a lit cell: brightness follows the fill level, foam pulls towards white.
 static rgb_t fill_color(const palette_t *pal, float t, int foam)
 {
+    if (pal->rainbow) {
+        return scale(rainbow(t, foam), 0.25f + 0.75f * t);
+    }
     rgb_t c = scale(mix(pal->deep, pal->bright, t), 0.25f + 0.75f * t);
     return mix(c, pal->foam, (float)foam / 3.0f * 0.65f * t);
 }
@@ -107,14 +135,15 @@ bool fluid_render_init(fluid_render_t *r, int screen_w, int screen_h, int max_ce
     r->prev = zalloc(alloc, (size_t)max_cells);
     r->shown = zalloc(alloc, (size_t)max_cells);
     r->hysteresis = 10;
-    r->tiles = zalloc(alloc, (size_t)64 * max_pitch * max_pitch * sizeof(uint16_t));
+    r->tiles = zalloc(alloc, (size_t)FLUID_RENDER_CODES * max_pitch * max_pitch * sizeof(uint16_t));
+    r->wall = zalloc(alloc, (size_t)max_cells);
     r->lut = zalloc(alloc, (size_t)4 * 256 * sizeof(uint16_t));
     r->col_of_x = zalloc(alloc, (size_t)screen_w * sizeof(int16_t));
     r->sub_x = zalloc(alloc, (size_t)screen_w * sizeof(uint16_t));
     r->row_of_y = zalloc(alloc, (size_t)screen_h * sizeof(int16_t));
     r->sub_y = zalloc(alloc, (size_t)screen_h * sizeof(uint16_t));
     r->full_redraw = true;
-    return r->cur && r->prev && r->shown && r->tiles && r->lut && r->col_of_x && r->sub_x && r->row_of_y && r->sub_y;
+    return r->cur && r->prev && r->shown && r->tiles && r->wall && r->lut && r->col_of_x && r->sub_x && r->row_of_y && r->sub_y;
 }
 
 static void build_tiles(fluid_render_t *r)
@@ -125,11 +154,12 @@ static void build_tiles(fluid_render_t *r)
     float dot_r = 0.40f * (float)p;
     float glow_r = 0.72f * (float)p;
 
-    for (int code = 0; code < 64; code++) {
-        int q = code & 15;
-        int foam = code >> 4;
+    for (int code = 0; code < FLUID_RENDER_CODES; code++) {
+        bool wall = code == FLUID_RENDER_WALL_CODE;
+        int q = wall ? 15 : code & 15;
+        int foam = wall ? 0 : code >> 4;
         float t = (float)q / 15.0f;
-        rgb_t lit = fill_color(pal, t, foam);
+        rgb_t lit = wall ? pal->wall : fill_color(pal, t, foam);
         uint16_t *tile = r->tiles + code * p * p;
         for (int ty = 0; ty < p; ty++) {
             for (int tx = 0; tx < p; tx++) {
@@ -139,7 +169,7 @@ static void build_tiles(fluid_render_t *r)
                     float dy = (float)ty - centre;
                     float d = sqrtf(dx * dx + dy * dy);
                     float a = clamp01(dot_r + 0.5f - d);
-                    float glow = 0.22f * clamp01(1.0f - d / glow_r) * t;
+                    float glow = wall ? 0.0f : 0.22f * clamp01(1.0f - d / glow_r) * t;
                     rgb_t dot = q == 0 ? pal->off : lit;
                     c = mix(scale(lit, glow), dot, a);
                 } else {
@@ -160,12 +190,18 @@ static void build_liquid_lut(fluid_render_t *r)
             float x = (float)v / 255.0f;
             float edge = smoothstep(thr - 0.07f, thr + 0.07f, x);
             float depth = clamp01((x - thr) / (1.0f - thr));
-            rgb_t rim = mix(pal->bright, pal->foam, 0.25f);
-            rgb_t c = mix(rim, pal->deep, powf(depth, 0.6f));
-            c = mix(c, pal->foam, (float)foam / 3.0f * 0.6f);
+            rgb_t c;
+            if (pal->rainbow) {
+                c = rainbow(powf(depth, 0.6f), foam);
+            } else {
+                rgb_t rim = mix(pal->bright, pal->foam, 0.25f);
+                c = mix(rim, pal->deep, powf(depth, 0.6f));
+                c = mix(c, pal->foam, (float)foam / 3.0f * 0.6f);
+            }
             r->lut[foam * 256 + v] = to565(r, scale(c, edge));
         }
     }
+    r->wall_color = to565(r, pal->wall);
 }
 
 static inline int floor_div(int a, int b)
@@ -247,12 +283,25 @@ void fluid_render_prepare(fluid_render_t *r, const uint8_t *level, const uint8_t
         }
     }
     if (r->style == FLUID_STYLE_LIQUID) {
+        // Codes use all 8 bits here, so walls live in their own mask; walls only
+        // change once a minute, and then the whole screen is redrawn.
+        bool walls = false;
+        bool changed = false;
         for (int i = 0; i < n; i++) {
-            r->cur[i] = (uint8_t)((r->shown[i] >> 2) | (foam[i] << 6));
+            uint8_t w = foam[i] == FLUID_RASTER_WALL;
+            changed |= w != r->wall[i];
+            walls |= w;
+            r->wall[i] = w;
+            r->cur[i] = w ? 0 : (uint8_t)((r->shown[i] >> 2) | (foam[i] << 6));
+        }
+        r->has_walls = walls;
+        if (changed) {
+            r->full_redraw = true;
         }
     } else {
         for (int i = 0; i < n; i++) {
-            r->cur[i] = (uint8_t)((r->shown[i] >> 4) | (foam[i] << 4));
+            r->cur[i] = foam[i] == FLUID_RASTER_WALL ? FLUID_RENDER_WALL_CODE
+                                                     : (uint8_t)((r->shown[i] >> 4) | (foam[i] << 4));
         }
     }
 }
@@ -369,10 +418,15 @@ static void render_liquid(const fluid_render_t *r, int y0, int lines, int x0, in
         uint32_t wy = r->sub_y[y];
         uint32_t iy = 256 - wy;
         const uint8_t *foam_row = wy >= 128 ? bot : top;
+        const uint8_t *wall_row = r->wall + (foam_row - r->cur);
         for (int x = x0; x <= x1; x++) {
             int c = r->col_of_x[x];
             uint32_t wx = r->sub_x[x];
             uint32_t ix = 256 - wx;
+            if (r->has_walls && wall_row[wx >= 128 ? c + 1 : c]) {
+                *out++ = r->wall_color;
+                continue;
+            }
             uint32_t a = (top[c] & 63u) << 2;
             uint32_t b = (top[c + 1] & 63u) << 2;
             uint32_t cc = (bot[c] & 63u) << 2;
