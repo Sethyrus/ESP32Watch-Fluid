@@ -172,6 +172,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--gravity")) gravity = (float)atof(argv[i + 1]);
         else if (!strcmp(argv[i], "--flip")) cfg.flip_ratio = (float)atof(argv[i + 1]);
         else if (!strcmp(argv[i], "--fps")) FPS = atoi(argv[i + 1]);
+        else if (!strcmp(argv[i], "--drift")) cfg.drift_k = (float)atof(argv[i + 1]);
+        else if (!strcmp(argv[i], "--slack")) cfg.drift_slack = (float)atof(argv[i + 1]);
         else if (!strcmp(argv[i], "--damping")) cfg.damping = (float)atof(argv[i + 1]);
         else if (!strcmp(argv[i], "--seconds")) seconds = atof(argv[i + 1]);
         else if (!strcmp(argv[i], "--max-particles")) cfg.max_particles = atoi(argv[i + 1]);
@@ -212,7 +214,7 @@ int main(int argc, char **argv)
         c->frame = calloc((size_t)W * H, sizeof(uint16_t));
     }
 
-    const double dump_at[] = {2.9, 4.0, 5.0, 7.5, 9.5, 11.9, 13.0, 16.9};
+    const double dump_at[] = {2.9, 4.0, 5.0, 7.5, 9.5, 11.9, 13.0, 16.9, 19.9, 31.9};
     const int ndump = (int)(sizeof(dump_at) / sizeof(dump_at[0]));
     int next_dump = 0;
     double sum_stage[7] = {0};

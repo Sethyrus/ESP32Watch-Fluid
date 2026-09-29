@@ -65,6 +65,8 @@ fluid_config_t fluid_default_config(void)
         .flip_ratio = 0.85f,
         .max_cells_per_step = 2.0f,
         .damping = 0.5f,
+        .drift_k = 0.5f,
+        .drift_slack = 0.4f,
         .alloc = NULL,
         .clock_us = NULL,
         .parallel = NULL,
@@ -700,7 +702,7 @@ static void pressure_job(void *ctx, int part)
     }
 }
 
-static void solve_incompressibility(fluid_t *f, int iters)
+static void solve_incompressibility(fluid_t *f, int iters, float dt)
 {
     int n = f->ny;
     const float *restrict s = f->s;
@@ -711,10 +713,18 @@ static void solve_incompressibility(fluid_t *f, int iters)
 
     // Only interior FLUID cells with an open neighbour take part, red cells ((i + j)
     // even) first, then black. Per cell, precompute omega / (open neighbours) and the
-    // drift-compensation term (compression above rest density, k = 1), which do not
-    // change during the iterations.
+    // drift-compensation term, which do not change during the iterations.
+    //
+    // Drift compensation subtracts k * (density - rest) from the divergence. The
+    // reference uses k = 1 in metres (h = 0.03 m, dt = 1/60 s), about 0.5 h/dt; in
+    // pixels k = 1 is ~300x weaker, and the fluid slowly compresses under its own
+    // weight (worse at lower frame rates). Hence k = drift_k * h / dt. Compression up
+    // to drift_slack above rest is ignored so normal density noise does not make the
+    // resting surface shimmer.
     float omega = f->cfg.over_relaxation;
     float rest = f->rest_density;
+    float drift = f->cfg.drift_k * f->h * fluid_recip(dt);
+    float slack_rest = rest * (1.0f + f->cfg.drift_slack);
     float *restrict bias = f->density; // density is not needed after this point
     int nf = 0;
     int n_red = 0;
@@ -731,8 +741,8 @@ static void solve_incompressibility(fluid_t *f, int iters)
                 }
                 f->fluid_list[nf] = (uint16_t)c;
                 f->inv_s_sum[nf] = omega * fluid_recip(sum);
-                float compression = rest > 0.0f ? bias[c] - rest : 0.0f;
-                bias[c] = compression > 0.0f ? compression : 0.0f;
+                float compression = rest > 0.0f ? bias[c] - slack_rest : 0.0f;
+                bias[c] = compression > 0.0f ? drift * compression : 0.0f;
                 nf++;
             }
         }
@@ -839,7 +849,7 @@ void fluid_step(fluid_t *f, float gx, float gy, float dt, int substeps)
         st->us_p2g += elapsed(f, &t);
         update_density(f);
         st->us_density += elapsed(f, &t);
-        solve_incompressibility(f, f->cfg.pressure_iters);
+        solve_incompressibility(f, f->cfg.pressure_iters, sdt);
         st->us_pressure += elapsed(f, &t);
         run2(f, g2p_job, f);
         st->us_g2p += elapsed(f, &t);

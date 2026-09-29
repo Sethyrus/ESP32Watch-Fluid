@@ -35,6 +35,8 @@ typedef struct {
     float flip_ratio;         // 0 = PIC (calm), 1 = FLIP (lively); ~0.9
     float max_cells_per_step; // particle speed clamp, in cells per substep
     float damping;            // velocity decay in 1/s (0 = none), helps the fluid settle
+    float drift_k;            // compression push-back, in cells per step (reference ~0.5)
+    float drift_slack;        // compression up to slack * rest density is left alone
     fluid_alloc_fn alloc;     // NULL = malloc; buffers are never freed
     fluid_clock_fn clock_us;  // optional, fills per-stage timings in fluid_stats_t
     fluid_parallel_fn parallel; // optional second core; NULL runs both parts in order
