@@ -4,6 +4,7 @@
 // to the panel, and dumps PPM frames. See run.sh.
 
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,7 +18,6 @@
 #define W 410
 #define H 502
 #define BAND 16
-#define FPS 60
 #define QSPI_BYTES_PER_S 20.0e6 // 40 MHz x 4 lines
 
 static int64_t now_us(void)
@@ -25,6 +25,33 @@ static int64_t now_us(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+// --threads: run the second part of each job on another thread, like the device's
+// helper on core 0, to catch overlapping writes (also try with -fsanitize=thread).
+typedef struct {
+    fluid_job_fn fn;
+    void *ctx;
+} job_arg_t;
+
+static void *job_thread(void *p)
+{
+    job_arg_t *a = p;
+    a->fn(a->ctx, 1);
+    return NULL;
+}
+
+static void parallel_threads(fluid_job_fn fn, void *ctx)
+{
+    pthread_t th;
+    job_arg_t a = {fn, ctx};
+    if (pthread_create(&th, NULL, job_thread, &a) != 0) {
+        fn(ctx, 0);
+        fn(ctx, 1);
+        return;
+    }
+    fn(ctx, 0);
+    pthread_join(th, NULL);
 }
 
 typedef struct {
@@ -41,6 +68,8 @@ typedef struct {
     double bytes_tail; // last second, fluid settling
     int frames;
 } style_ctx_t;
+
+static int FPS = 60; // --fps: simulated frame rate (dt = 1 / FPS)
 
 static void write_ppm(const char *path, const uint16_t *px)
 {
@@ -126,6 +155,14 @@ int main(int argc, char **argv)
     double seconds = 22.0;
     const char *out = "out";
 
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--threads")) {
+            cfg.parallel = parallel_threads;
+            memmove(&argv[i], &argv[i + 1], (size_t)(argc - i - 1) * sizeof(char *));
+            argc--;
+            break;
+        }
+    }
     for (int i = 1; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--cell")) cfg.cell_size = (float)atof(argv[i + 1]);
         else if (!strcmp(argv[i], "--fill")) cfg.fill_fraction = (float)atof(argv[i + 1]);
@@ -134,6 +171,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--substeps")) substeps = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "--gravity")) gravity = (float)atof(argv[i + 1]);
         else if (!strcmp(argv[i], "--flip")) cfg.flip_ratio = (float)atof(argv[i + 1]);
+        else if (!strcmp(argv[i], "--fps")) FPS = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "--damping")) cfg.damping = (float)atof(argv[i + 1]);
         else if (!strcmp(argv[i], "--seconds")) seconds = atof(argv[i + 1]);
         else if (!strcmp(argv[i], "--max-particles")) cfg.max_particles = atoi(argv[i + 1]);
@@ -153,9 +191,10 @@ int main(int argc, char **argv)
     }
     const fluid_stats_t *st = fluid_get_stats(f);
     int np0 = fluid_particle_count(f);
-    printf("cell=%.0fpx grid=%dx%d particles=%d r=%.2fpx iters=%d sep=%d substeps=%d flip=%.2f damping=%.2f g=%.0fpx/s2\n",
+    printf("cell=%.0fpx grid=%dx%d particles=%d r=%.2fpx iters=%d sep=%d substeps=%d flip=%.2f damping=%.2f g=%.0fpx/s2%s\n",
            cfg.cell_size, st->cells_x, st->cells_y, np0, fluid_particle_radius(f), cfg.pressure_iters,
-           cfg.separation_iters, substeps, cfg.flip_ratio, cfg.damping, gravity);
+           cfg.separation_iters, substeps, cfg.flip_ratio, cfg.damping, gravity,
+           cfg.parallel ? " threads" : "");
 
     style_ctx_t styles[FLUID_STYLE_COUNT];
     for (int s = 0; s < FLUID_STYLE_COUNT; s++) {

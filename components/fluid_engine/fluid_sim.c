@@ -1,6 +1,7 @@
 #include "fluid_internal.h"
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -58,7 +59,7 @@ fluid_config_t fluid_default_config(void)
         .cell_size = 10.0f,
         .fill_fraction = 0.40f,
         .max_particles = 4000,
-        .pressure_iters = 30,
+        .pressure_iters = 20,
         .separation_iters = 1,
         .over_relaxation = 1.9f,
         .flip_ratio = 0.85f,
@@ -66,6 +67,7 @@ fluid_config_t fluid_default_config(void)
         .damping = 0.5f,
         .alloc = NULL,
         .clock_us = NULL,
+        .parallel = NULL,
     };
     return c;
 }
@@ -251,16 +253,50 @@ static void apply_obstacle_to_grid(fluid_t *f)
     }
 }
 
-static void integrate_particles(fluid_t *f, float dt, float gx, float gy)
+// Work split between the caller and the optional helper (fluid_config_t.parallel).
+// Every split below touches disjoint memory in its two parts.
+static void run2(fluid_t *f, fluid_job_fn fn, void *ctx)
 {
+    if (f->cfg.parallel != NULL) {
+        f->cfg.parallel(fn, ctx);
+    } else {
+        fn(ctx, 0);
+        fn(ctx, 1);
+    }
+}
+
+static inline void particle_range(const fluid_t *f, int part, int *i0, int *i1)
+{
+    int mid = f->num_particles / 2;
+    *i0 = part == 0 ? 0 : mid;
+    *i1 = part == 0 ? mid : f->num_particles;
+}
+
+typedef struct {
+    fluid_t *f;
+    float dt;
+    float gx;
+    float gy;
+} integrate_job_t;
+
+static void integrate_job(void *ctx, int part)
+{
+    const integrate_job_t *job = ctx;
+    fluid_t *f = job->f;
+    float dt = job->dt;
     float vmax = f->cfg.max_cells_per_step * f->h / dt;
     float vmax2 = vmax * vmax;
     float keep = 1.0f / (1.0f + f->cfg.damping * dt);
+    float gdx = dt * job->gx;
+    float gdy = dt * job->gy;
     float *restrict pos = f->pos;
     float *restrict vel = f->vel;
-    for (int i = 0; i < f->num_particles; i++) {
-        float vx = vel[2 * i] * keep + dt * gx;
-        float vy = vel[2 * i + 1] * keep + dt * gy;
+    int i0;
+    int i1;
+    particle_range(f, part, &i0, &i1);
+    for (int i = i0; i < i1; i++) {
+        float vx = vel[2 * i] * keep + gdx;
+        float vy = vel[2 * i + 1] * keep + gdy;
         float v2 = vx * vx + vy * vy;
         if (v2 > vmax2) {
             float k = vmax * fluid_rsqrt(v2);
@@ -271,6 +307,92 @@ static void integrate_particles(fluid_t *f, float dt, float gx, float gy)
         vel[2 * i + 1] = vy;
         pos[2 * i] += vx * dt;
         pos[2 * i + 1] += vy * dt;
+    }
+}
+
+// Push-apart for base hash columns [x_begin, x_end). Each pair is visited once: a cell
+// against itself (j > i) and its 4 "forward" neighbours (+x-1y, +x, +x+1y, +y), so a
+// base column x only touches particles in columns x and x + 1.
+static void separate_columns(fluid_t *f, int x_begin, int x_end)
+{
+    int pnx = f->pnx;
+    int pny = f->pny;
+    float *restrict pos = f->pos;
+    const int32_t *restrict first = f->cell_count;
+    const uint16_t *restrict ids = f->cell_ids;
+    float min_dist = 2.0f * f->radius;
+    float min_dist2 = min_dist * min_dist;
+
+    for (int xi = x_begin; xi < x_end; xi++) {
+        for (int yi = 0; yi < pny; yi++) {
+            int c = xi * pny + yi;
+            int a_begin = first[c];
+            int a_end = first[c + 1];
+            if (a_begin == a_end) {
+                continue;
+            }
+            // Particle ranges of the 4 forward neighbours, resolved once per cell.
+            int nb_begin[4];
+            int nb_end[4];
+            int nbs = 0;
+            if (xi + 1 < pnx) {
+                int right = c + pny;
+                for (int dy = -1; dy <= 1; dy++) {
+                    if (yi + dy >= 0 && yi + dy < pny) {
+                        nb_begin[nbs] = first[right + dy];
+                        nb_end[nbs++] = first[right + dy + 1];
+                    }
+                }
+            }
+            if (yi + 1 < pny) {
+                nb_begin[nbs] = first[c + 1];
+                nb_end[nbs++] = first[c + 2];
+            }
+            for (int ka = a_begin; ka < a_end; ka++) {
+                int a = ids[ka];
+                float ax = pos[2 * a];
+                float ay = pos[2 * a + 1];
+                // Same cell (later particles only), then the forward neighbours.
+                for (int nb = -1; nb < nbs; nb++) {
+                    int kb = nb < 0 ? ka + 1 : nb_begin[nb];
+                    int b_end = nb < 0 ? a_end : nb_end[nb];
+                    for (; kb < b_end; kb++) {
+                        int b = ids[kb];
+                        float dx = pos[2 * b] - ax;
+                        float dy = pos[2 * b + 1] - ay;
+                        float d2 = dx * dx + dy * dy;
+                        if (d2 > min_dist2 || d2 == 0.0f) {
+                            continue;
+                        }
+                        // Push apart by 0.6 of the overlap, s = 0.6 * (min_dist - d) / d,
+                        // without sqrtf or a division. Pairs are visited once (the
+                        // reference, 0.5, visits twice); 0.6 is the committed tuning.
+                        float s = 0.6f * (min_dist * fluid_rsqrt(d2) - 1.0f);
+                        dx *= s;
+                        dy *= s;
+                        ax -= dx;
+                        ay -= dy;
+                        pos[2 * b] += dx;
+                        pos[2 * b + 1] += dy;
+                    }
+                }
+                pos[2 * a] = ax;
+                pos[2 * a + 1] = ay;
+            }
+        }
+    }
+}
+
+// Parts own base columns [0, mid - 1) and [mid, pnx): they touch columns [0, mid) and
+// [mid, pnx) respectively, which never overlap. Column mid - 1 runs afterwards.
+static void separate_job(void *ctx, int part)
+{
+    fluid_t *f = ctx;
+    int mid = f->pnx / 2;
+    if (part == 0) {
+        separate_columns(f, 0, mid - 1);
+    } else {
+        separate_columns(f, mid, f->pnx);
     }
 }
 
@@ -306,59 +428,16 @@ static void push_particles_apart(fluid_t *f, int iters)
         ids[first[c]] = (uint16_t)i;
     }
 
-    float min_dist = 2.0f * f->radius;
-    float min_dist2 = min_dist * min_dist;
+    int mid = pnx / 2;
     for (int it = 0; it < iters; it++) {
-        // Each pair once: a cell against itself (j > i) and its 4 "forward" neighbours
-        // (+x-1y, +x, +x+1y, +y). Same-iteration in-place updates, as in the reference.
-        for (int xi = 0; xi < pnx; xi++) {
-            for (int yi = 0; yi < pny; yi++) {
-                int c = xi * pny + yi;
-                int a_end = first[c + 1];
-                for (int ka = first[c]; ka < a_end; ka++) {
-                    int a = ids[ka];
-                    float ax = pos[2 * a];
-                    float ay = pos[2 * a + 1];
-                    for (int n = 0; n < 5; n++) {
-                        int nx_i = xi + (n == 0 || n == 4 ? 0 : 1);
-                        int ny_i = yi + (n == 0 ? 0 : (n == 4 ? 1 : n - 2));
-                        if (nx_i >= pnx || ny_i < 0 || ny_i >= pny) {
-                            continue;
-                        }
-                        int nc = nx_i * pny + ny_i;
-                        int kb = n == 0 ? ka + 1 : first[nc];
-                        int b_end = first[nc + 1];
-                        for (; kb < b_end; kb++) {
-                            int b = ids[kb];
-                            float dx = pos[2 * b] - ax;
-                            float dy = pos[2 * b + 1] - ay;
-                            float d2 = dx * dx + dy * dy;
-                            if (d2 > min_dist2 || d2 == 0.0f) {
-                                continue;
-                            }
-                            // s = 0.5 * (min_dist - d) / d without sqrtf or a division. Pairs
-                            // are visited once (the reference visits twice), which packs the
-                            // rest state ~8% denser; a larger factor (0.7) matches the
-                            // reference volume but leaves the surface shimmering at rest.
-                            float s = 0.6f * (min_dist * fluid_rsqrt(d2) - 1.0f);
-                            dx *= s;
-                            dy *= s;
-                            ax -= dx;
-                            ay -= dy;
-                            pos[2 * b] += dx;
-                            pos[2 * b + 1] += dy;
-                        }
-                    }
-                    pos[2 * a] = ax;
-                    pos[2 * a + 1] = ay;
-                }
-            }
-        }
+        run2(f, separate_job, f);
+        separate_columns(f, mid - 1, mid);
     }
 }
 
-static void handle_collisions(fluid_t *f)
+static void collide_job(void *ctx, int part)
 {
+    fluid_t *f = ctx;
     float h = f->h;
     float r = f->radius;
     float *restrict pos = f->pos;
@@ -367,8 +446,11 @@ static void handle_collisions(fluid_t *f)
     float ob_r2 = ob_r * ob_r;
     float cx = 0.5f * f->cfg.width + h;
     float cy = 0.5f * f->cfg.height + h;
+    int i0;
+    int i1;
+    particle_range(f, part, &i0, &i1);
 
-    for (int i = 0; i < f->num_particles; i++) {
+    for (int i = i0; i < i1; i++) {
         float x = pos[2 * i];
         float y = pos[2 * i + 1];
         float vx = vel[2 * i];
@@ -417,21 +499,83 @@ static void handle_collisions(fluid_t *f)
     }
 }
 
-static void particles_to_grid(fluid_t *f)
+// Per-component particle-to-grid splat, normalization and solid faces. u and v (and
+// their weight arrays) are separate, so the two components run in parallel.
+static void p2g_job(void *ctx, int comp)
 {
+    fluid_t *f = ctx;
     int n = f->ny;
     int nx = f->nx;
     float h = f->h;
     float h1 = f->inv_h;
     float h2 = 0.5f * h;
+    float dx = comp == 0 ? 0.0f : h2;
+    float dy = comp == 0 ? h2 : 0.0f;
+    float *restrict fg = comp == 0 ? f->u : f->v;
+    float *restrict dg = comp == 0 ? f->du : f->dv;
+    const float *restrict prev = comp == 0 ? f->prev_u : f->prev_v;
+    const uint8_t *restrict ct = f->cell_type;
+    const float *restrict pos = f->pos;
+    const float *restrict vel = f->vel;
+    size_t cells_f = (size_t)f->num_cells * sizeof(float);
+
+    memset(fg, 0, cells_f);
+    memset(dg, 0, cells_f);
+    for (int i = 0; i < f->num_particles; i++) {
+        float x = clampf(pos[2 * i], h, (float)(nx - 1) * h);
+        float y = clampf(pos[2 * i + 1], h, (float)(n - 1) * h);
+        int x0 = (int)((x - dx) * h1);
+        if (x0 > nx - 2) x0 = nx - 2;
+        float tx = ((x - dx) - (float)x0 * h) * h1;
+        int x1 = x0 + 1 > nx - 2 ? nx - 2 : x0 + 1;
+        int y0 = (int)((y - dy) * h1);
+        if (y0 > n - 2) y0 = n - 2;
+        float ty = ((y - dy) - (float)y0 * h) * h1;
+        int y1 = y0 + 1 > n - 2 ? n - 2 : y0 + 1;
+        float sx = 1.0f - tx;
+        float sy = 1.0f - ty;
+        float d0 = sx * sy;
+        float d1 = tx * sy;
+        float d2 = tx * ty;
+        float d3 = sx * ty;
+        int nr0 = x0 * n + y0;
+        int nr1 = x1 * n + y0;
+        int nr2 = x1 * n + y1;
+        int nr3 = x0 * n + y1;
+        float pv = vel[2 * i + comp];
+        fg[nr0] += pv * d0; dg[nr0] += d0;
+        fg[nr1] += pv * d1; dg[nr1] += d1;
+        fg[nr2] += pv * d2; dg[nr2] += d2;
+        fg[nr3] += pv * d3; dg[nr3] += d3;
+    }
+    for (int i = 0; i < f->num_cells; i++) {
+        if (dg[i] > 0.0f) {
+            fg[i] *= fluid_recip(dg[i]);
+        }
+    }
+
+    // Faces touching solid cells keep their previous (wall / obstacle) velocity.
+    int step = comp == 0 ? n : 1;
+    for (int i = 0; i < nx; i++) {
+        for (int j = 0; j < n; j++) {
+            int c = i * n + j;
+            bool has_prev = comp == 0 ? i > 0 : j > 0;
+            if (ct[c] == FLUID_CELL_SOLID || (has_prev && ct[c - step] == FLUID_CELL_SOLID)) {
+                fg[c] = prev[c];
+            }
+        }
+    }
+}
+
+static void particles_to_grid(fluid_t *f)
+{
+    int n = f->ny;
+    int nx = f->nx;
+    float h1 = f->inv_h;
     size_t cells_f = (size_t)f->num_cells * sizeof(float);
 
     memcpy(f->prev_u, f->u, cells_f);
     memcpy(f->prev_v, f->v, cells_f);
-    memset(f->du, 0, cells_f);
-    memset(f->dv, 0, cells_f);
-    memset(f->u, 0, cells_f);
-    memset(f->v, 0, cells_f);
 
     for (int i = 0; i < f->num_cells; i++) {
         f->cell_type[i] = f->s[i] == 0.0f ? FLUID_CELL_SOLID : FLUID_CELL_AIR;
@@ -445,60 +589,8 @@ static void particles_to_grid(fluid_t *f)
         }
     }
 
-    for (int comp = 0; comp < 2; comp++) {
-        float dx = comp == 0 ? 0.0f : h2;
-        float dy = comp == 0 ? h2 : 0.0f;
-        float *restrict fg = comp == 0 ? f->u : f->v;
-        float *restrict dg = comp == 0 ? f->du : f->dv;
-        for (int i = 0; i < f->num_particles; i++) {
-            float x = clampf(f->pos[2 * i], h, (float)(nx - 1) * h);
-            float y = clampf(f->pos[2 * i + 1], h, (float)(n - 1) * h);
-            int x0 = (int)((x - dx) * h1);
-            if (x0 > nx - 2) x0 = nx - 2;
-            float tx = ((x - dx) - (float)x0 * h) * h1;
-            int x1 = x0 + 1 > nx - 2 ? nx - 2 : x0 + 1;
-            int y0 = (int)((y - dy) * h1);
-            if (y0 > n - 2) y0 = n - 2;
-            float ty = ((y - dy) - (float)y0 * h) * h1;
-            int y1 = y0 + 1 > n - 2 ? n - 2 : y0 + 1;
-            float sx = 1.0f - tx;
-            float sy = 1.0f - ty;
-            float d0 = sx * sy;
-            float d1 = tx * sy;
-            float d2 = tx * ty;
-            float d3 = sx * ty;
-            int nr0 = x0 * n + y0;
-            int nr1 = x1 * n + y0;
-            int nr2 = x1 * n + y1;
-            int nr3 = x0 * n + y1;
-            float pv = f->vel[2 * i + comp];
-            fg[nr0] += pv * d0; dg[nr0] += d0;
-            fg[nr1] += pv * d1; dg[nr1] += d1;
-            fg[nr2] += pv * d2; dg[nr2] += d2;
-            fg[nr3] += pv * d3; dg[nr3] += d3;
-        }
-        for (int i = 0; i < f->num_cells; i++) {
-            if (dg[i] > 0.0f) {
-                fg[i] *= fluid_recip(dg[i]);
-            }
-        }
-    }
-
-    // Faces touching solid cells keep their previous (wall / obstacle) velocity.
-    for (int i = 0; i < nx; i++) {
-        for (int j = 0; j < n; j++) {
-            int c = i * n + j;
-            bool solid = f->cell_type[c] == FLUID_CELL_SOLID;
-            if (solid || (i > 0 && f->cell_type[c - n] == FLUID_CELL_SOLID)) {
-                f->u[c] = f->prev_u[c];
-            }
-            if (solid || (j > 0 && f->cell_type[c - 1] == FLUID_CELL_SOLID)) {
-                f->v[c] = f->prev_v[c];
-            }
-        }
-    }
+    run2(f, p2g_job, f);
 }
-
 static void update_density(fluid_t *f)
 {
     int n = f->ny;
@@ -541,61 +633,133 @@ static void update_density(fluid_t *f)
     }
 }
 
+typedef struct {
+    fluid_t *f;
+    int n_red;
+    int iters;
+    atomic_int arrived;    // two-party spin barrier between colour sweeps
+    atomic_int generation;
+} pressure_job_t;
+
+// Gauss-Seidel over fluid_list[k0, k1).
+static void pressure_sweep(fluid_t *f, int k0, int k1)
+{
+    int n = f->ny;
+    const float *restrict s = f->s;
+    const float *restrict bias = f->density;
+    const uint16_t *restrict list = f->fluid_list;
+    const float *restrict k_list = f->inv_s_sum;
+    float *restrict u = f->u;
+    float *restrict v = f->v;
+
+    for (int k = k0; k < k1; k++) {
+        int c = list[k];
+        float div = u[c + n] - u[c] + v[c + 1] - v[c] - bias[c];
+        float p = -div * k_list[k];
+        u[c] -= s[c - n] * p;
+        u[c + n] += s[c + n] * p;
+        v[c] -= s[c - 1] * p;
+        v[c + 1] += s[c + 1] * p;
+    }
+}
+
+// Both parts wait here until the other one arrives. Only valid when the two parts
+// really run concurrently (cfg.parallel set).
+static void pressure_barrier(pressure_job_t *job)
+{
+    int gen = atomic_load(&job->generation);
+    if (atomic_fetch_add(&job->arrived, 1) == 1) {
+        atomic_store(&job->arrived, 0);
+        atomic_fetch_add(&job->generation, 1);
+    } else {
+        while (atomic_load(&job->generation) == gen) {
+        }
+    }
+}
+
+// All iterations in one job: cells of one red-black colour never share a face, so each
+// colour is split between the parts, with a barrier before the other colour starts.
+// One fork per solve instead of two per iteration.
+static void pressure_job(void *ctx, int part)
+{
+    pressure_job_t *job = ctx;
+    fluid_t *f = job->f;
+    int nf = f->num_fluid;
+    int red_mid = job->n_red / 2;
+    int black_mid = job->n_red + (nf - job->n_red) / 2;
+    int r0 = part == 0 ? 0 : red_mid;
+    int r1 = part == 0 ? red_mid : job->n_red;
+    int b0 = part == 0 ? job->n_red : black_mid;
+    int b1 = part == 0 ? black_mid : nf;
+
+    for (int it = 0; it < job->iters; it++) {
+        pressure_sweep(f, r0, r1);
+        pressure_barrier(job);
+        pressure_sweep(f, b0, b1);
+        pressure_barrier(job);
+    }
+}
+
 static void solve_incompressibility(fluid_t *f, int iters)
 {
     int n = f->ny;
     const float *restrict s = f->s;
-    float *restrict u = f->u;
-    float *restrict v = f->v;
     size_t cells_f = (size_t)f->num_cells * sizeof(float);
 
-    memcpy(f->prev_u, u, cells_f);
-    memcpy(f->prev_v, v, cells_f);
+    memcpy(f->prev_u, f->u, cells_f);
+    memcpy(f->prev_v, f->v, cells_f);
 
-    // Only interior FLUID cells with an open neighbour take part. Per cell, precompute
-    // omega / (open neighbours) and the drift-compensation term (compression above rest
-    // density, k = 1), which do not change during the iterations.
+    // Only interior FLUID cells with an open neighbour take part, red cells ((i + j)
+    // even) first, then black. Per cell, precompute omega / (open neighbours) and the
+    // drift-compensation term (compression above rest density, k = 1), which do not
+    // change during the iterations.
     float omega = f->cfg.over_relaxation;
     float rest = f->rest_density;
     float *restrict bias = f->density; // density is not needed after this point
     int nf = 0;
-    for (int i = 1; i < f->nx - 1; i++) {
-        for (int j = 1; j < n - 1; j++) {
-            int c = i * n + j;
-            if (f->cell_type[c] != FLUID_CELL_FLUID) {
-                continue;
+    int n_red = 0;
+    for (int colour = 0; colour < 2; colour++) {
+        for (int i = 1; i < f->nx - 1; i++) {
+            for (int j = 1 + ((i + 1 + colour) & 1); j < n - 1; j += 2) {
+                int c = i * n + j;
+                if (f->cell_type[c] != FLUID_CELL_FLUID) {
+                    continue;
+                }
+                float sum = s[c - n] + s[c + n] + s[c - 1] + s[c + 1];
+                if (sum == 0.0f) {
+                    continue;
+                }
+                f->fluid_list[nf] = (uint16_t)c;
+                f->inv_s_sum[nf] = omega * fluid_recip(sum);
+                float compression = rest > 0.0f ? bias[c] - rest : 0.0f;
+                bias[c] = compression > 0.0f ? compression : 0.0f;
+                nf++;
             }
-            float sum = s[c - n] + s[c + n] + s[c - 1] + s[c + 1];
-            if (sum == 0.0f) {
-                continue;
-            }
-            f->fluid_list[nf] = (uint16_t)c;
-            f->inv_s_sum[nf] = omega * fluid_recip(sum);
-            float compression = rest > 0.0f ? bias[c] - rest : 0.0f;
-            bias[c] = compression > 0.0f ? compression : 0.0f;
-            nf++;
+        }
+        if (colour == 0) {
+            n_red = nf;
         }
     }
     f->num_fluid = nf;
     f->stats.fluid_cells = nf;
 
-    const uint16_t *restrict list = f->fluid_list;
-    const float *restrict k_list = f->inv_s_sum;
-    for (int it = 0; it < iters; it++) {
-        for (int k = 0; k < nf; k++) {
-            int c = list[k];
-            float div = u[c + n] - u[c] + v[c + 1] - v[c] - bias[c];
-            float p = -div * k_list[k];
-            u[c] -= s[c - n] * p;
-            u[c + n] += s[c + n] * p;
-            v[c] -= s[c - 1] * p;
-            v[c + 1] += s[c + 1] * p;
+    if (f->cfg.parallel == NULL) {
+        for (int it = 0; it < iters; it++) {
+            pressure_sweep(f, 0, n_red);
+            pressure_sweep(f, n_red, nf);
         }
+        return;
     }
+    pressure_job_t job = {.f = f, .n_red = n_red, .iters = iters};
+    atomic_init(&job.arrived, 0);
+    atomic_init(&job.generation, 0);
+    f->cfg.parallel(pressure_job, &job);
 }
 
-static void grid_to_particles(fluid_t *f)
+// Per-component grid-to-particle transfer; each writes only its velocity component.
+static void g2p_job(void *ctx, int comp)
 {
+    fluid_t *f = ctx;
     int n = f->ny;
     int nx = f->nx;
     float h = f->h;
@@ -603,48 +767,48 @@ static void grid_to_particles(fluid_t *f)
     float h2 = 0.5f * h;
     float flip = f->cfg.flip_ratio;
     const uint8_t *restrict ct = f->cell_type;
+    float dx = comp == 0 ? 0.0f : h2;
+    float dy = comp == 0 ? h2 : 0.0f;
+    const float *restrict fg = comp == 0 ? f->u : f->v;
+    const float *restrict pf = comp == 0 ? f->prev_u : f->prev_v;
+    const float *restrict pos = f->pos;
+    float *restrict vel = f->vel;
+    int offset = comp == 0 ? n : 1;
 
-    for (int comp = 0; comp < 2; comp++) {
-        float dx = comp == 0 ? 0.0f : h2;
-        float dy = comp == 0 ? h2 : 0.0f;
-        const float *restrict fg = comp == 0 ? f->u : f->v;
-        const float *restrict pf = comp == 0 ? f->prev_u : f->prev_v;
-        int offset = comp == 0 ? n : 1;
-        for (int i = 0; i < f->num_particles; i++) {
-            float x = clampf(f->pos[2 * i], h, (float)(nx - 1) * h);
-            float y = clampf(f->pos[2 * i + 1], h, (float)(n - 1) * h);
-            int x0 = (int)((x - dx) * h1);
-            if (x0 > nx - 2) x0 = nx - 2;
-            float tx = ((x - dx) - (float)x0 * h) * h1;
-            int x1 = x0 + 1 > nx - 2 ? nx - 2 : x0 + 1;
-            int y0 = (int)((y - dy) * h1);
-            if (y0 > n - 2) y0 = n - 2;
-            float ty = ((y - dy) - (float)y0 * h) * h1;
-            int y1 = y0 + 1 > n - 2 ? n - 2 : y0 + 1;
-            float sx = 1.0f - tx;
-            float sy = 1.0f - ty;
-            float d0 = sx * sy;
-            float d1 = tx * sy;
-            float d2 = tx * ty;
-            float d3 = sx * ty;
-            int nr0 = x0 * n + y0;
-            int nr1 = x1 * n + y0;
-            int nr2 = x1 * n + y1;
-            int nr3 = x0 * n + y1;
-            // A face is valid when either adjacent cell is not air.
-            float v0 = (ct[nr0] != FLUID_CELL_AIR || ct[nr0 - offset] != FLUID_CELL_AIR) ? d0 : 0.0f;
-            float v1 = (ct[nr1] != FLUID_CELL_AIR || ct[nr1 - offset] != FLUID_CELL_AIR) ? d1 : 0.0f;
-            float v2 = (ct[nr2] != FLUID_CELL_AIR || ct[nr2 - offset] != FLUID_CELL_AIR) ? d2 : 0.0f;
-            float v3 = (ct[nr3] != FLUID_CELL_AIR || ct[nr3 - offset] != FLUID_CELL_AIR) ? d3 : 0.0f;
-            float d = v0 + v1 + v2 + v3;
-            if (d > 0.0f) {
-                float inv_d = fluid_recip(d);
-                float pic = (v0 * fg[nr0] + v1 * fg[nr1] + v2 * fg[nr2] + v3 * fg[nr3]) * inv_d;
-                float corr = (v0 * (fg[nr0] - pf[nr0]) + v1 * (fg[nr1] - pf[nr1]) +
-                              v2 * (fg[nr2] - pf[nr2]) + v3 * (fg[nr3] - pf[nr3])) * inv_d;
-                float cur = f->vel[2 * i + comp];
-                f->vel[2 * i + comp] = (1.0f - flip) * pic + flip * (cur + corr);
-            }
+    for (int i = 0; i < f->num_particles; i++) {
+        float x = clampf(pos[2 * i], h, (float)(nx - 1) * h);
+        float y = clampf(pos[2 * i + 1], h, (float)(n - 1) * h);
+        int x0 = (int)((x - dx) * h1);
+        if (x0 > nx - 2) x0 = nx - 2;
+        float tx = ((x - dx) - (float)x0 * h) * h1;
+        int x1 = x0 + 1 > nx - 2 ? nx - 2 : x0 + 1;
+        int y0 = (int)((y - dy) * h1);
+        if (y0 > n - 2) y0 = n - 2;
+        float ty = ((y - dy) - (float)y0 * h) * h1;
+        int y1 = y0 + 1 > n - 2 ? n - 2 : y0 + 1;
+        float sx = 1.0f - tx;
+        float sy = 1.0f - ty;
+        float d0 = sx * sy;
+        float d1 = tx * sy;
+        float d2 = tx * ty;
+        float d3 = sx * ty;
+        int nr0 = x0 * n + y0;
+        int nr1 = x1 * n + y0;
+        int nr2 = x1 * n + y1;
+        int nr3 = x0 * n + y1;
+        // A face is valid when either adjacent cell is not air.
+        float v0 = (ct[nr0] != FLUID_CELL_AIR || ct[nr0 - offset] != FLUID_CELL_AIR) ? d0 : 0.0f;
+        float v1 = (ct[nr1] != FLUID_CELL_AIR || ct[nr1 - offset] != FLUID_CELL_AIR) ? d1 : 0.0f;
+        float v2 = (ct[nr2] != FLUID_CELL_AIR || ct[nr2 - offset] != FLUID_CELL_AIR) ? d2 : 0.0f;
+        float v3 = (ct[nr3] != FLUID_CELL_AIR || ct[nr3 - offset] != FLUID_CELL_AIR) ? d3 : 0.0f;
+        float d = v0 + v1 + v2 + v3;
+        if (d > 0.0f) {
+            float inv_d = fluid_recip(d);
+            float pic = (v0 * fg[nr0] + v1 * fg[nr1] + v2 * fg[nr2] + v3 * fg[nr3]) * inv_d;
+            float corr = (v0 * (fg[nr0] - pf[nr0]) + v1 * (fg[nr1] - pf[nr1]) +
+                          v2 * (fg[nr2] - pf[nr2]) + v3 * (fg[nr3] - pf[nr3])) * inv_d;
+            float cur = vel[2 * i + comp];
+            vel[2 * i + comp] = (1.0f - flip) * pic + flip * (cur + corr);
         }
     }
 }
@@ -661,13 +825,14 @@ void fluid_step(fluid_t *f, float gx, float gy, float dt, int substeps)
     int64_t t = f->cfg.clock_us ? f->cfg.clock_us() : 0;
 
     for (int k = 0; k < substeps; k++) {
-        integrate_particles(f, sdt, gx, gy);
+        integrate_job_t integrate = {.f = f, .dt = sdt, .gx = gx, .gy = gy};
+        run2(f, integrate_job, &integrate);
         st->us_integrate += elapsed(f, &t);
         if (f->cfg.separation_iters > 0) {
             push_particles_apart(f, f->cfg.separation_iters);
         }
         st->us_separate += elapsed(f, &t);
-        handle_collisions(f);
+        run2(f, collide_job, f);
         st->us_collide += elapsed(f, &t);
         apply_obstacle_to_grid(f);
         particles_to_grid(f);
@@ -676,7 +841,7 @@ void fluid_step(fluid_t *f, float gx, float gy, float dt, int substeps)
         st->us_density += elapsed(f, &t);
         solve_incompressibility(f, f->cfg.pressure_iters);
         st->us_pressure += elapsed(f, &t);
-        grid_to_particles(f);
+        run2(f, g2p_job, f);
         st->us_g2p += elapsed(f, &t);
     }
 }

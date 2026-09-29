@@ -16,6 +16,12 @@ extern "C" {
 typedef void *(*fluid_alloc_fn)(size_t bytes);
 typedef int64_t (*fluid_clock_fn)(void);
 
+// A job split in two parts that touch disjoint memory.
+typedef void (*fluid_job_fn)(void *ctx, int part);
+// Runs fn(ctx, 0) and fn(ctx, 1), possibly at the same time on two cores, and returns
+// once both are done.
+typedef void (*fluid_parallel_fn)(fluid_job_fn fn, void *ctx);
+
 typedef struct {
     float width;              // container size in px
     float height;
@@ -31,6 +37,7 @@ typedef struct {
     float damping;            // velocity decay in 1/s (0 = none), helps the fluid settle
     fluid_alloc_fn alloc;     // NULL = malloc; buffers are never freed
     fluid_clock_fn clock_us;  // optional, fills per-stage timings in fluid_stats_t
+    fluid_parallel_fn parallel; // optional second core; NULL runs both parts in order
 } fluid_config_t;
 
 typedef struct {

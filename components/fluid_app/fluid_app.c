@@ -29,6 +29,11 @@
 #define FLUID_TASK_PRIORITY 5
 #define FLUID_SIM_STACK 6144
 #define FLUID_RENDER_STACK 4096
+#define FLUID_HELPER_STACK 3072
+#define FLUID_HELPER_PRIORITY (FLUID_TASK_PRIORITY + 1)
+// Render above the helper: it mostly sleeps on the display DMA and, when a band is
+// done, must refill the bus at once or the panel link sits idle.
+#define FLUID_RENDER_PRIORITY (FLUID_TASK_PRIORITY + 2)
 #define FLUID_BOOT_DEBOUNCE_US 30000
 #define FLUID_BOOT_LONG_US 700000
 #define FLUID_FINGER_RADIUS 30.0f
@@ -67,6 +72,13 @@ static uint16_t *s_dma[2];
 static int s_dma_next;
 static TaskHandle_t s_render_task;
 
+// Second half of each simulation stage runs on core 0 (fluid_config_t.parallel). The
+// render task there mostly waits on the display DMA, so the helper borrows that time.
+static TaskHandle_t s_helper_task;
+static TaskHandle_t s_sim_task;
+static fluid_job_fn s_job_fn;
+static void *s_job_ctx;
+
 // Hot buffers go to internal RAM; PSRAM only as a fallback, and it is logged.
 static void *alloc_fast(size_t bytes)
 {
@@ -89,6 +101,26 @@ static void *alloc_psram(size_t bytes)
 static int64_t clock_us(void)
 {
     return esp_timer_get_time();
+}
+
+static void helper_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        s_job_fn(s_job_ctx, 1);
+        xTaskNotifyGive(s_sim_task);
+    }
+}
+
+// Called only from the sim task. Task notifications order the memory accesses.
+static void run_parallel(fluid_job_fn fn, void *ctx)
+{
+    s_job_fn = fn;
+    s_job_ctx = ctx;
+    xTaskNotifyGive(s_helper_task);
+    fn(ctx, 0);
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 }
 
 static fluid_raster_t *raster_for(fluid_style_t style)
@@ -148,6 +180,7 @@ static esp_err_t init_engine(void)
     config.max_cells_per_step = 3.0f;
     config.alloc = alloc_fast;
     config.clock_us = clock_us;
+    config.parallel = run_parallel;
     s_fluid = fluid_create(&config);
     if (s_fluid == NULL) {
         ESP_LOGE(TAG, "fluid_create failed (out of memory?)");
@@ -419,6 +452,7 @@ static void render_task(void *arg)
     uint32_t render_max = 0;
     uint64_t bytes_total = 0;
     uint32_t bytes_max = 0;
+    uint64_t compute_total = 0;
     int64_t last_log = esp_timer_get_time();
 
     for (;;) {
@@ -447,6 +481,7 @@ static void render_task(void *arg)
         int64_t t0 = esp_timer_get_time();
         fluid_render_prepare(&s_render, fr->level, fr->foam);
         uint32_t bytes = 0;
+        uint32_t compute_us = 0;
         bool failed = false;
         for (int y = 0; y < FLUID_H; y += FLUID_BAND_LINES) {
             int lines = FLUID_H - y < FLUID_BAND_LINES ? FLUID_H - y : FLUID_BAND_LINES;
@@ -459,7 +494,9 @@ static void render_task(void *arg)
             // drains the previous colour transfer before sending the next window.
             uint16_t *buf = s_dma[s_dma_next];
             s_dma_next ^= 1;
+            int64_t c0 = esp_timer_get_time();
             fluid_render_band(&s_render, y, lines, x0, x1, buf);
+            compute_us += (uint32_t)(esp_timer_get_time() - c0);
             if (esp_lcd_panel_draw_bitmap(s_panel, x0, y, x1 + 1, y + lines, buf) != ESP_OK) {
                 failed = true;
                 break;
@@ -480,16 +517,17 @@ static void render_task(void *arg)
         render_max = us > render_max ? us : render_max;
         bytes_total += bytes;
         bytes_max = bytes > bytes_max ? bytes : bytes_max;
+        compute_total += compute_us;
         int64_t now = esp_timer_get_time();
         if (now - last_log >= FLUID_STATS_US) {
             ESP_LOGI(TAG,
-                     "render: fps=%" PRIu32 " style=%s frame_avg=%" PRIu32 "us max=%" PRIu32 "us KB_avg=%" PRIu32
-                     " KB_max=%" PRIu32 " draw_err=%" PRIu32,
+                     "render: fps=%" PRIu32 " style=%s frame_avg=%" PRIu32 "us max=%" PRIu32 "us compute_avg=%" PRIu32
+                     "us KB_avg=%" PRIu32 " KB_max=%" PRIu32 " draw_err=%" PRIu32,
                      (uint32_t)((uint64_t)frames * 1000000 / (uint64_t)(now - last_log)), fluid_style_name(style),
-                     (uint32_t)(render_total / frames), render_max, (uint32_t)(bytes_total / frames / 1024),
-                     bytes_max / 1024, errors);
+                     (uint32_t)(render_total / frames), render_max, (uint32_t)(compute_total / frames),
+                     (uint32_t)(bytes_total / frames / 1024), bytes_max / 1024, errors);
             frames = errors = render_max = bytes_max = 0;
-            render_total = bytes_total = 0;
+            render_total = bytes_total = compute_total = 0;
             last_log = now;
         }
     }
@@ -521,9 +559,11 @@ esp_err_t fluid_app_start(void)
         return err;
     }
 
-    if (xTaskCreatePinnedToCore(render_task, "fluid_render", FLUID_RENDER_STACK, NULL, FLUID_TASK_PRIORITY,
+    if (xTaskCreatePinnedToCore(render_task, "fluid_render", FLUID_RENDER_STACK, NULL, FLUID_RENDER_PRIORITY,
                                 &s_render_task, FLUID_RENDER_CORE) != pdPASS ||
-        xTaskCreatePinnedToCore(sim_task, "fluid_sim", FLUID_SIM_STACK, NULL, FLUID_TASK_PRIORITY, NULL,
+        xTaskCreatePinnedToCore(helper_task, "fluid_helper", FLUID_HELPER_STACK, NULL, FLUID_HELPER_PRIORITY,
+                                &s_helper_task, FLUID_RENDER_CORE) != pdPASS ||
+        xTaskCreatePinnedToCore(sim_task, "fluid_sim", FLUID_SIM_STACK, NULL, FLUID_TASK_PRIORITY, &s_sim_task,
                                 FLUID_SIM_CORE) != pdPASS) {
         ESP_LOGE(TAG, "Task creation failed");
         return ESP_ERR_NO_MEM;

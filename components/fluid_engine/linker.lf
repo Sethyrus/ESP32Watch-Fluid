@@ -1,7 +1,0 @@
-# Run the whole engine from internal IRAM (rodata in DRAM). With
-# CONFIG_SPIRAM_FETCH_INSTRUCTIONS the code would otherwise execute from PSRAM through
-# the instruction cache shared with the render core.
-[mapping:fluid_engine]
-archive: libfluid_engine.a
-entries:
-    * (noflash)

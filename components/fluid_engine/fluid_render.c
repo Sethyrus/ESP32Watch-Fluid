@@ -311,11 +311,16 @@ bool fluid_render_band_dirty(const fluid_render_t *r, int y0, int lines, int *x0
     return true;
 }
 
+// Copies whole tile rows (pitch pixels per cell) instead of looking up every pixel.
 static void render_tiles(const fluid_render_t *r, int y0, int lines, int x0, int x1, uint16_t *dst)
 {
     int p = r->pitch;
     int pp = p * p;
     int w = x1 - x0 + 1;
+    int grid_x0 = r->off_x;
+    int grid_x1 = r->off_x + r->cols * p - 1;
+    int lead = (grid_x0 > x0 ? grid_x0 : x0) - x0;            // pixels left of the grid
+    int body_end = (grid_x1 < x1 ? grid_x1 : x1);              // last pixel on the grid
     for (int line = 0; line < lines; line++) {
         int y = y0 + line;
         uint16_t *out = dst + line * w;
@@ -326,9 +331,28 @@ static void render_tiles(const fluid_render_t *r, int y0, int lines, int x0, int
         }
         const uint8_t *codes = r->cur + row * r->cols;
         const uint16_t *tiles = r->tiles + r->sub_y[y] * p;
-        for (int x = x0; x <= x1; x++) {
-            int c = r->col_of_x[x];
-            *out++ = c < 0 ? 0 : tiles[codes[c] * pp + r->sub_x[x]];
+        if (lead > w) {
+            lead = w;
+        }
+        memset(out, 0, (size_t)lead * sizeof(uint16_t));
+        uint16_t *o = out + lead;
+        int x = x0 + lead;
+        while (x <= body_end) {
+            int sub = r->sub_x[x];
+            int n = p - sub;
+            if (x + n - 1 > body_end) {
+                n = body_end - x + 1;
+            }
+            const uint16_t *src = tiles + codes[r->col_of_x[x]] * pp + sub;
+            for (int k = 0; k < n; k++) {
+                o[k] = src[k];
+            }
+            o += n;
+            x += n;
+        }
+        int tail = (int)(out + w - o);
+        if (tail > 0) {
+            memset(o, 0, (size_t)tail * sizeof(uint16_t));
         }
     }
 }

@@ -21,7 +21,10 @@ menu "Fluid simulation"
     config FLUID_PRESSURE_ITERS
         int "Pressure solver iterations per substep"
         range 5 60
-        default 30
+        default 20
+        help
+            Red-black Gauss-Seidel, split across both cores. 20 is visually the
+            same as 30 in tools/host_bench.
 
     config FLUID_GRAVITY_PX_PER_G
         int "Gravity scale (px/s^2 per g)"
