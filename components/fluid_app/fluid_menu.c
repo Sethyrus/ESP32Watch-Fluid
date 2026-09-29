@@ -248,6 +248,13 @@ static void reset_clicked(lv_event_t *e)
     s_menu.closing = true;
 }
 
+static void exit_clicked(lv_event_t *e)
+{
+    (void)e;
+    s_menu.result->exit_app = true;
+    s_menu.closing = true;
+}
+
 static void continue_clicked(lv_event_t *e)
 {
     (void)e;
@@ -355,7 +362,7 @@ static void build_menu(const uint16_t *background)
     }
 
     fluid_settings_t *st = s_menu.settings;
-    lv_obj_t *card = create_card(screen, 340, 410);
+    lv_obj_t *card = create_card(screen, 340, s_menu.cfg.show_exit ? 466 : 410);
     s_menu.card = card;
     create_label(card, "Fluido", 28);
 
@@ -392,6 +399,10 @@ static void build_menu(const uint16_t *background)
     lv_obj_set_height(row, 50);
     create_button(row, "Reiniciar", 140, 46, MENU_DANGER_BG, reset_clicked, NULL);
     create_button(row, "Continuar", 140, 46, MENU_BUTTON_BG, continue_clicked, NULL);
+
+    if (s_menu.cfg.show_exit) {
+        create_button(card, "Salir al launcher", 296, 46, 0x334155, exit_clicked, NULL);
+    }
 }
 
 void fluid_menu_run(fluid_settings_t *settings, const uint16_t *background, bool (*close_requested)(void),

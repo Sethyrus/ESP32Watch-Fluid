@@ -2,11 +2,15 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "watch_launcher.h"
 
 static const char *TAG = "ESP32WatchFluid";
 
 void app_main(void)
 {
+    // Launcher mode: any reset from here on returns to the launcher.
+    watch_launcher_boot_once();
+
     ESP_LOGI(TAG, "Starting fluid simulation");
 
     esp_err_t err = fluid_app_start();

@@ -43,6 +43,7 @@
   - PWR short press opens and closes the menu (core convention: PWR = back/menu).
   - BOOT short press cycles the style, and BOOT long press cycles the palette (shortcuts). Inside the menu, BOOT closes it.
   - Holding PWR for ~6 s powers the board off.
+- Launcher mode (core `watch_launcher.h`): `app_main` calls `watch_launcher_boot_once()` first. The menu shows `Salir al launcher` only when `watch_launcher_is_available()`; `run_menu()` saves the settings and then calls `watch_launcher_exit()`. `partitions.csv` is a copy of the shared table in ESP32Watch-Launcher; do not change it here alone.
 - **Walls and clock.**
   - `fluid_set_walls()` samples the SDF once, which costs ~24 ms on the S3, so call it only when the minute changes.
   - Faces against static solids are zeroed in P2G; do not go back to keeping the previous value there (it pumps fluid).

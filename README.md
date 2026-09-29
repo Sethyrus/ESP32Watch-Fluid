@@ -16,6 +16,7 @@ Tambien es un reloj: los digitos de la hora son paredes, y el fluido fluye a su 
 
 **Menu (`PWR`):**
 - Opciones: estilo, paleta, reloj si/no, ajustar hora, brillo, reiniciar el fluido y continuar.
+- Arrancada desde el launcher, ademas `Salir al launcher` (guarda antes los ajustes).
 - Se cierra con `Continuar`, `PWR` o `BOOT`.
 - Mientras esta abierto, el fluido queda congelado y atenuado detras.
 - Los ajustes se guardan en NVS y se conservan al reiniciar.
@@ -36,6 +37,8 @@ idf.py set-target esp32s3
 idf.py build
 idf.py -p <PORT> flash monitor   # p. ej. /dev/tty.usbmodem1101; sin -p lo autodetecta
 ```
+
+Para tenerla junto a las demas apps y elegirla desde un menu de arranque, grabarla con [ESP32Watch-Launcher](https://github.com/Sethyrus/ESP32Watch-Launcher) (`./flash_all.sh`). `partitions.csv` es la tabla comun del launcher; en standalone la app ocupa `factory`.
 
 La calidad y el coste se ajustan en `idf.py menuconfig` > *Fluid simulation*: tamano de celda, relleno, substeps, iteraciones, gravedad, brillo inicial, reloj por defecto y RTC. Los valores que se queden deben ir a `sdkconfig.defaults`.
 

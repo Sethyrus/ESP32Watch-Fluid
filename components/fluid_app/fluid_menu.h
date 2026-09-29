@@ -27,11 +27,13 @@ typedef struct {
     int width;
     int height;
     int style_count;
+    bool show_exit; // "Salir" row, only when started from the launcher
 } fluid_menu_config_t;
 
 typedef struct {
     bool reset_fluid;  // "Reiniciar fluido" pressed
     bool time_changed; // hour/minute were set
+    bool exit_app;     // "Salir" pressed: return to the launcher
 } fluid_menu_result_t;
 
 // Once, from the render task.

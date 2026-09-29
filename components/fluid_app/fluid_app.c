@@ -26,6 +26,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "watch_buttons.h"
+#include "watch_launcher.h"
 #include "watch_rtc.h"
 
 #define FLUID_W BSP_LCD_H_RES
@@ -489,6 +490,9 @@ static void run_menu(void)
     ESP_LOGI(TAG, "Menu closed: style=%s palette=%s clock=%d brightness=%d%s",
              fluid_style_name((fluid_style_t)s_settings.style), fluid_palette_name(s_settings.palette),
              s_settings.clock, s_settings.brightness, r->reset_fluid ? " reset" : "");
+    if (r->exit_app) {
+        watch_launcher_exit(); // settings already saved above
+    }
 }
 
 static void sim_task(void *arg)
@@ -717,6 +721,7 @@ static void render_menu(const fluid_frame_t *fr)
             .width = FLUID_W,
             .height = FLUID_H,
             .style_count = FLUID_STYLE_COUNT,
+            .show_exit = watch_launcher_is_available(),
         };
         esp_err_t err = fluid_menu_init(&cfg);
         if (err != ESP_OK) {
