@@ -85,10 +85,12 @@ static float container_sdf(const fluid_config_t *c, float x, float y, float *nx,
     float qy = fabsf(dy) - (hh - r);
 
     if (qx > 0.0f && qy > 0.0f) {
-        float len = sqrtf(qx * qx + qy * qy);
+        float q2 = qx * qx + qy * qy;
+        float inv_len = fluid_rsqrt(q2); // corner region: qx, qy > 0
+        float len = q2 * inv_len;
         if (nx != NULL) {
-            *nx = sx * qx / len;
-            *ny = sy * qy / len;
+            *nx = sx * qx * inv_len;
+            *ny = sy * qy * inv_len;
         }
         return len - r;
     }
@@ -261,7 +263,7 @@ static void integrate_particles(fluid_t *f, float dt, float gx, float gy)
         float vy = vel[2 * i + 1] * keep + dt * gy;
         float v2 = vx * vx + vy * vy;
         if (v2 > vmax2) {
-            float k = vmax / sqrtf(v2);
+            float k = vmax * fluid_rsqrt(v2);
             vx *= k;
             vy *= k;
         }
@@ -307,43 +309,50 @@ static void push_particles_apart(fluid_t *f, int iters)
     float min_dist = 2.0f * f->radius;
     float min_dist2 = min_dist * min_dist;
     for (int it = 0; it < iters; it++) {
-        for (int i = 0; i < np; i++) {
-            float px = pos[2 * i];
-            float py = pos[2 * i + 1];
-            int pxi = (int)(px * inv);
-            int pyi = (int)(py * inv);
-            int x0 = pxi - 1 < 0 ? 0 : pxi - 1;
-            int y0 = pyi - 1 < 0 ? 0 : pyi - 1;
-            int x1 = pxi + 1 > pnx - 1 ? pnx - 1 : pxi + 1;
-            int y1 = pyi + 1 > pny - 1 ? pny - 1 : pyi + 1;
-            for (int xi = x0; xi <= x1; xi++) {
-                for (int yi = y0; yi <= y1; yi++) {
-                    int c = xi * pny + yi;
-                    int end = first[c + 1];
-                    for (int k = first[c]; k < end; k++) {
-                        int id = ids[k];
-                        if (id == i) {
+        // Each pair once: a cell against itself (j > i) and its 4 "forward" neighbours
+        // (+x-1y, +x, +x+1y, +y). Same-iteration in-place updates, as in the reference.
+        for (int xi = 0; xi < pnx; xi++) {
+            for (int yi = 0; yi < pny; yi++) {
+                int c = xi * pny + yi;
+                int a_end = first[c + 1];
+                for (int ka = first[c]; ka < a_end; ka++) {
+                    int a = ids[ka];
+                    float ax = pos[2 * a];
+                    float ay = pos[2 * a + 1];
+                    for (int n = 0; n < 5; n++) {
+                        int nx_i = xi + (n == 0 || n == 4 ? 0 : 1);
+                        int ny_i = yi + (n == 0 ? 0 : (n == 4 ? 1 : n - 2));
+                        if (nx_i >= pnx || ny_i < 0 || ny_i >= pny) {
                             continue;
                         }
-                        float dx = pos[2 * id] - px;
-                        float dy = pos[2 * id + 1] - py;
-                        float d2 = dx * dx + dy * dy;
-                        if (d2 > min_dist2 || d2 == 0.0f) {
-                            continue;
+                        int nc = nx_i * pny + ny_i;
+                        int kb = n == 0 ? ka + 1 : first[nc];
+                        int b_end = first[nc + 1];
+                        for (; kb < b_end; kb++) {
+                            int b = ids[kb];
+                            float dx = pos[2 * b] - ax;
+                            float dy = pos[2 * b + 1] - ay;
+                            float d2 = dx * dx + dy * dy;
+                            if (d2 > min_dist2 || d2 == 0.0f) {
+                                continue;
+                            }
+                            // s = 0.5 * (min_dist - d) / d without sqrtf or a division. Pairs
+                            // are visited once (the reference visits twice), which packs the
+                            // rest state ~8% denser; a larger factor (0.7) matches the
+                            // reference volume but leaves the surface shimmering at rest.
+                            float s = 0.6f * (min_dist * fluid_rsqrt(d2) - 1.0f);
+                            dx *= s;
+                            dy *= s;
+                            ax -= dx;
+                            ay -= dy;
+                            pos[2 * b] += dx;
+                            pos[2 * b + 1] += dy;
                         }
-                        float d = sqrtf(d2);
-                        float s = 0.5f * (min_dist - d) / d;
-                        dx *= s;
-                        dy *= s;
-                        px -= dx;
-                        py -= dy;
-                        pos[2 * id] += dx;
-                        pos[2 * id + 1] += dy;
                     }
+                    pos[2 * a] = ax;
+                    pos[2 * a + 1] = ay;
                 }
             }
-            pos[2 * i] = px;
-            pos[2 * i + 1] = py;
         }
     }
 }
@@ -470,7 +479,7 @@ static void particles_to_grid(fluid_t *f)
         }
         for (int i = 0; i < f->num_cells; i++) {
             if (dg[i] > 0.0f) {
-                fg[i] /= dg[i];
+                fg[i] *= fluid_recip(dg[i]);
             }
         }
     }
@@ -543,7 +552,12 @@ static void solve_incompressibility(fluid_t *f, int iters)
     memcpy(f->prev_u, u, cells_f);
     memcpy(f->prev_v, v, cells_f);
 
-    // Only interior FLUID cells with an open neighbour take part; precompute 1/sum.
+    // Only interior FLUID cells with an open neighbour take part. Per cell, precompute
+    // omega / (open neighbours) and the drift-compensation term (compression above rest
+    // density, k = 1), which do not change during the iterations.
+    float omega = f->cfg.over_relaxation;
+    float rest = f->rest_density;
+    float *restrict bias = f->density; // density is not needed after this point
     int nf = 0;
     for (int i = 1; i < f->nx - 1; i++) {
         for (int j = 1; j < n - 1; j++) {
@@ -556,35 +570,26 @@ static void solve_incompressibility(fluid_t *f, int iters)
                 continue;
             }
             f->fluid_list[nf] = (uint16_t)c;
-            f->inv_s_sum[nf] = 1.0f / sum;
+            f->inv_s_sum[nf] = omega * fluid_recip(sum);
+            float compression = rest > 0.0f ? bias[c] - rest : 0.0f;
+            bias[c] = compression > 0.0f ? compression : 0.0f;
             nf++;
         }
     }
     f->num_fluid = nf;
     f->stats.fluid_cells = nf;
 
-    float omega = f->cfg.over_relaxation;
-    float rest = f->rest_density;
-    const float *restrict dens = f->density;
+    const uint16_t *restrict list = f->fluid_list;
+    const float *restrict k_list = f->inv_s_sum;
     for (int it = 0; it < iters; it++) {
         for (int k = 0; k < nf; k++) {
-            int c = f->fluid_list[k];
-            float sx0 = s[c - n];
-            float sx1 = s[c + n];
-            float sy0 = s[c - 1];
-            float sy1 = s[c + 1];
-            float div = u[c + n] - u[c] + v[c + 1] - v[c];
-            if (rest > 0.0f) {
-                float compression = dens[c] - rest;
-                if (compression > 0.0f) {
-                    div -= compression; // drift compensation, k = 1
-                }
-            }
-            float p = -div * f->inv_s_sum[k] * omega;
-            u[c] -= sx0 * p;
-            u[c + n] += sx1 * p;
-            v[c] -= sy0 * p;
-            v[c + 1] += sy1 * p;
+            int c = list[k];
+            float div = u[c + n] - u[c] + v[c + 1] - v[c] - bias[c];
+            float p = -div * k_list[k];
+            u[c] -= s[c - n] * p;
+            u[c + n] += s[c + n] * p;
+            v[c] -= s[c - 1] * p;
+            v[c + 1] += s[c + 1] * p;
         }
     }
 }
@@ -633,7 +638,7 @@ static void grid_to_particles(fluid_t *f)
             float v3 = (ct[nr3] != FLUID_CELL_AIR || ct[nr3 - offset] != FLUID_CELL_AIR) ? d3 : 0.0f;
             float d = v0 + v1 + v2 + v3;
             if (d > 0.0f) {
-                float inv_d = 1.0f / d;
+                float inv_d = fluid_recip(d);
                 float pic = (v0 * fg[nr0] + v1 * fg[nr1] + v2 * fg[nr2] + v3 * fg[nr3]) * inv_d;
                 float corr = (v0 * (fg[nr0] - pf[nr0]) + v1 * (fg[nr1] - pf[nr1]) +
                               v2 * (fg[nr2] - pf[nr2]) + v3 * (fg[nr3] - pf[nr3])) * inv_d;

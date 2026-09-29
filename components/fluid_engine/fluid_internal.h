@@ -2,7 +2,43 @@
 
 // Shared between fluid_sim.c and fluid_raster.c; not part of the public API.
 
+#include <stdint.h>
+#include <string.h>
+
 #include "fluid_sim.h"
+
+// On the ESP32-S3 float division and sqrtf are software calls (__divsf3, sqrtf; not
+// even -ffast-math inlines them), about 100+ cycles each. Hot loops use these
+// bit-trick approximations refined with Newton steps instead. Positive, normal
+// inputs only.
+
+// 1/sqrt(x), two Newton steps: relative error ~5e-6.
+static inline float fluid_rsqrt(float x)
+{
+    uint32_t i;
+    memcpy(&i, &x, sizeof(i));
+    i = 0x5f375a86u - (i >> 1);
+    float y;
+    memcpy(&y, &i, sizeof(y));
+    float hx = 0.5f * x;
+    y = y * (1.5f - hx * y * y);
+    y = y * (1.5f - hx * y * y);
+    return y;
+}
+
+// 1/x, three Newton steps: relative error ~1e-7 (float precision).
+static inline float fluid_recip(float x)
+{
+    uint32_t i;
+    memcpy(&i, &x, sizeof(i));
+    i = 0x7ef311c3u - i;
+    float y;
+    memcpy(&y, &i, sizeof(y));
+    y = y * (2.0f - x * y);
+    y = y * (2.0f - x * y);
+    y = y * (2.0f - x * y);
+    return y;
+}
 
 enum {
     FLUID_CELL_FLUID = 0,

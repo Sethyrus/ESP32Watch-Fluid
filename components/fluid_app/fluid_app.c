@@ -1,6 +1,7 @@
 #include "fluid_app.h"
 
 #include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "bsp/display.h"
@@ -33,6 +34,9 @@
 #define FLUID_FINGER_RADIUS 30.0f
 #define FLUID_FINGER_MAX_SPEED 3000.0f
 #define FLUID_STATS_US 5000000
+#define FLUID_DT_MIN (1.0f / 120.0f)
+#define FLUID_DT_MAX (1.0f / 30.0f)
+#define FLUID_TOUCH_RETRY_US 100000
 
 static const char *TAG = "fluid_app";
 
@@ -140,6 +144,8 @@ static esp_err_t init_engine(void)
     config.fill_fraction = (float)CONFIG_FLUID_FILL_PERCENT / 100.0f;
     config.pressure_iters = CONFIG_FLUID_PRESSURE_ITERS;
     config.max_particles = 12000;
+    // dt follows real frame time (up to 1/30 s), so allow faster particles per step.
+    config.max_cells_per_step = 3.0f;
     config.alloc = alloc_fast;
     config.clock_us = clock_us;
     s_fluid = fluid_create(&config);
@@ -220,17 +226,26 @@ static void poll_boot(int64_t now, bool *short_press, bool *long_press)
 }
 
 // The finger is a moving circular obstacle; its velocity comes from frame deltas.
-static void poll_touch(float dt)
+// The FT3168 NACKs reads while idle (low-power monitor mode), so after a failed read
+// it is only polled every FLUID_TOUCH_RETRY_US; a touch wakes it and restores
+// per-frame reads.
+static void poll_touch(int64_t now, float dt, uint32_t *errors)
 {
     static bool down;
     static float last_x;
     static float last_y;
+    static int64_t retry_at;
 
     bool touching = false;
     esp_lcd_touch_point_data_t point = {0};
-    if (s_touch != NULL && esp_lcd_touch_read_data(s_touch) == ESP_OK) {
-        uint8_t count = 0;
-        touching = esp_lcd_touch_get_data(s_touch, &point, &count, 1) == ESP_OK && count > 0;
+    if (s_touch != NULL && now >= retry_at) {
+        if (esp_lcd_touch_read_data(s_touch) == ESP_OK) {
+            uint8_t count = 0;
+            touching = esp_lcd_touch_get_data(s_touch, &point, &count, 1) == ESP_OK && count > 0;
+        } else {
+            (*errors)++;
+            retry_at = now + FLUID_TOUCH_RETRY_US;
+        }
     }
     if (!touching) {
         down = false;
@@ -261,25 +276,35 @@ static void sim_task(void *arg)
         ESP_LOGW(TAG, "IMU unavailable (%s); gravity fixed downwards", esp_err_to_name(err));
     }
 
-    const float dt = 1.0f / FLUID_FPS;
     const float g_scale = (float)CONFIG_FLUID_GRAVITY_PX_PER_G;
     fluid_style_t style = FLUID_STYLE_LED;
     int palette = 0;
     uint32_t frame = 0;
     int64_t next_us = esp_timer_get_time();
+    int64_t last_step_us = next_us - 1000000 / FLUID_FPS;
 
+    // Per-window stats; stage[] follows the fluid_stats_t order.
+    static const char *const stage_names[7] = {"int", "sep", "col", "p2g", "den", "prs", "g2p"};
     uint32_t frames = 0;
     uint32_t overruns = 0;
     uint32_t imu_errors = 0;
+    uint32_t touch_errors = 0;
+    uint64_t input_total = 0;
     uint64_t sim_total = 0;
     uint32_t sim_max = 0;
     uint64_t raster_total = 0;
-    uint64_t sep_total = 0;
-    uint64_t pressure_total = 0;
+    uint64_t dt_total = 0;
+    uint64_t stage[7] = {0};
     int64_t last_log = next_us;
 
     for (;;) {
         int64_t t0 = esp_timer_get_time();
+
+        // Real elapsed time keeps the fluid at physical speed whatever the frame rate.
+        // Clamped so a stall slows the fluid down instead of destabilising it.
+        float dt = (float)(t0 - last_step_us) * 1e-6f;
+        dt = dt < FLUID_DT_MIN ? FLUID_DT_MIN : (dt > FLUID_DT_MAX ? FLUID_DT_MAX : dt);
+        last_step_us = t0;
 
         bool short_press = false;
         bool long_press = false;
@@ -307,7 +332,8 @@ static void sim_task(void *arg)
                 imu_errors++;
             }
         }
-        poll_touch(dt);
+        poll_touch(t0, dt, &touch_errors);
+        int64_t t_in = esp_timer_get_time();
 
         fluid_step(s_fluid, gx, gy, dt, CONFIG_FLUID_SUBSTEPS);
         int64_t t1 = esp_timer_get_time();
@@ -327,24 +353,39 @@ static void sim_task(void *arg)
         xTaskNotifyGive(s_render_task);
 
         const fluid_stats_t *st = fluid_get_stats(s_fluid);
-        uint32_t sim_us = (uint32_t)(t1 - t0);
+        uint32_t sim_us = (uint32_t)(t1 - t_in);
         frames++;
+        input_total += (uint64_t)(t_in - t0);
         sim_total += sim_us;
         sim_max = sim_us > sim_max ? sim_us : sim_max;
         raster_total += (uint64_t)(t2 - t1);
-        sep_total += st->us_separate;
-        pressure_total += st->us_pressure;
+        dt_total += (uint64_t)(dt * 1e6f);
+        stage[0] += st->us_integrate;
+        stage[1] += st->us_separate;
+        stage[2] += st->us_collide;
+        stage[3] += st->us_p2g;
+        stage[4] += st->us_density;
+        stage[5] += st->us_pressure;
+        stage[6] += st->us_g2p;
         if (t2 - last_log >= FLUID_STATS_US) {
+            char stages[96];
+            int len = 0;
+            for (int i = 0; i < 7; i++) {
+                len += snprintf(stages + len, sizeof(stages) - (size_t)len, "%s%s=%" PRIu32, i ? " " : "",
+                                stage_names[i], (uint32_t)(stage[i] / frames));
+            }
             ESP_LOGI(TAG,
-                     "sim: frames=%" PRIu32 " step_avg=%" PRIu32 "us max=%" PRIu32 "us (separate=%" PRIu32
-                     " pressure=%" PRIu32 ") raster=%" PRIu32 "us overruns=%" PRIu32 " imu_err=%" PRIu32
-                     " fluid_cells=%d internal_free=%u min=%u",
-                     frames, (uint32_t)(sim_total / frames), sim_max, (uint32_t)(sep_total / frames),
-                     (uint32_t)(pressure_total / frames), (uint32_t)(raster_total / frames), overruns, imu_errors,
-                     st->fluid_cells, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     "sim: fps=%" PRIu32 " step_avg=%" PRIu32 "us max=%" PRIu32 "us (%s) input=%" PRIu32
+                     "us raster=%" PRIu32 "us dt_avg=%" PRIu32 "us overruns=%" PRIu32 " imu_err=%" PRIu32
+                     " touch_err=%" PRIu32 " fluid_cells=%d internal_free=%u min=%u",
+                     (uint32_t)((uint64_t)frames * 1000000 / (uint64_t)(t2 - last_log)),
+                     (uint32_t)(sim_total / frames), sim_max, stages, (uint32_t)(input_total / frames),
+                     (uint32_t)(raster_total / frames), (uint32_t)(dt_total / frames), overruns, imu_errors,
+                     touch_errors, st->fluid_cells, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                      (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
-            frames = overruns = imu_errors = sim_max = 0;
-            sim_total = raster_total = sep_total = pressure_total = 0;
+            frames = overruns = imu_errors = touch_errors = sim_max = 0;
+            input_total = sim_total = raster_total = dt_total = 0;
+            memset(stage, 0, sizeof(stage));
             last_log = t2;
         }
 
@@ -461,6 +502,10 @@ esp_err_t fluid_app_start(void)
         return err;
     }
 
+    // The FT3168 NACKs reads while idle; poll_touch() backs off and counts those, so
+    // the driver's per-read error logs are only noise (and console time).
+    esp_log_level_set("FT5x06", ESP_LOG_NONE);
+    esp_log_level_set("lcd_panel.io.i2c", ESP_LOG_NONE);
     err = bsp_touch_new(NULL, &s_touch);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Touch unavailable: %s", esp_err_to_name(err));

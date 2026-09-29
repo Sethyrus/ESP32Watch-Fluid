@@ -5,4 +5,5 @@ idf_component_register(
         "fluid_raster.c"
         "fluid_render.c"
     INCLUDE_DIRS "include"
+    LDFRAGMENTS "linker.lf"
 )
