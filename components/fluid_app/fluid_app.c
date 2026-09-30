@@ -24,9 +24,9 @@
 #include "fluid_sim.h"
 #include "imu_service.h"
 #include "nvs.h"
-#include "nvs_flash.h"
 #include "watch_buttons.h"
 #include "watch_launcher.h"
+#include "watch_nvs.h"
 #include "watch_rtc.h"
 
 #define FLUID_W BSP_LCD_H_RES
@@ -839,21 +839,11 @@ static void render_task(void *arg)
     }
 }
 
-static void init_nvs(void)
-{
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        err = nvs_flash_init();
-    }
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "NVS unavailable (%s); settings will not persist", esp_err_to_name(err));
-    }
-}
-
 esp_err_t fluid_app_start(void)
 {
-    init_nvs();
+    if (watch_nvs_init() != ESP_OK) {
+        ESP_LOGW(TAG, "NVS unavailable; settings will not persist");
+    }
     settings_load();
     esp_err_t err = init_display();
     if (err != ESP_OK) {

@@ -97,7 +97,7 @@ dependencies:
       type: service
     version: 9.3.0
   watch_board:
-    component_hash: ba5b56de055fb44149563c992335f718a79bc3e946916c576514b318e909c9b9
+    component_hash: f73c899059e26f336c6375240bfd5584f3fbcd1e7e8d2c302fb229d7deb955e1
     dependencies:
     - name: idf
       version: '>=5.5,<5.6'
@@ -111,7 +111,7 @@ dependencies:
       git: https://github.com/Sethyrus/ESP32Watch-core.git
       path: components/watch_board
       type: git
-    version: 55230ba196e7372dd6a9bdba1a2436dc0eb027bd
+    version: f7a554bfebb18d2f6586dae7a9d563fdc2e2cd54
   waveshare/esp32_s3_touch_amoled_2_06:
     component_hash: fa4c373973c750e866a5efdd69e49b9990e5d6b4a621719ba6d6fb039ef582b6
     dependencies:
@@ -177,6 +177,6 @@ direct_dependencies:
 - lvgl/lvgl
 - watch_board
 - waveshare/esp32_s3_touch_amoled_2_06
-manifest_hash: b7fce9d8c337a85c2f8f2582a67ecd3915424c19c3965eabf104bdbb8d7bfbfa
+manifest_hash: b57a82ad3d6da66e48788988fad7c8003f453fcfac7b54730207a659d5055ffb
 target: esp32s3
 version: 2.0.0

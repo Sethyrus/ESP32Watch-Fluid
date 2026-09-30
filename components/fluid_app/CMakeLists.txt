@@ -12,7 +12,6 @@ idf_component_register(
         log
         lvgl__lvgl
         nvs_flash
-        watch_rtc
         waveshare__esp32_s3_touch_amoled_2_06
 )
 

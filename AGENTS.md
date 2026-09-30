@@ -4,11 +4,11 @@
 - ESP-IDF C firmware `ESP32WatchFluid`: a real-time FLIP/PIC fluid simulation driven by the IMU, drawn straight to the AMOLED; LVGL only runs for the settings menu. It doubles as a clock: the time digits are walls the fluid flows around. The entrypoint is `app_main()` in `main/main.c`, which only calls `fluid_app_start()`.
 - Target hardware is Waveshare `ESP32-S3-Touch-AMOLED-2.06`: ESP32-S3R8, AMOLED 410x502 QSPI, FT3168 touch, QMI8658 IMU, AXP2101 PMU.
 - Baseline stack is `ESP-IDF 5.5.4 + waveshare/esp32_s3_touch_amoled_2_06` BSP. LVGL 9.3.0 is pinned. It only runs for the PWR menu (`fluid_menu.c`), inside the render task, with no esp_lvgl_port. Do not migrate to ESP-IDF 6.x unless explicitly requested.
-- Shared board services (`imu_service.h`, `watch_buttons.h`) come from `watch_board` in https://github.com/Sethyrus/ESP32Watch-core, pinned by tag in `main/idf_component.yml`. Fix hardware bugs there, not in local copies. Hardware docs live in that repo's `docs/`.
+- Shared board services (`imu_service.h`, `watch_buttons.h`, `watch_rtc.h`, `watch_nvs.h`, `watch_launcher.h`) come from `watch_board` in https://github.com/Sethyrus/ESP32Watch-core, pinned by tag in `main/idf_component.yml`. Fix hardware bugs there, not in local copies. Hardware docs live in that repo's `docs/`.
 - Components:
   - `components/fluid_engine/` is pure C with no ESP-IDF includes: `fluid_sim` (FLIP plus walls), `fluid_clock` (7-segment digits as an SDF), `fluid_raster` (particles to LED grid) and `fluid_render` (RGB565 bands plus dirty detection). Keep it that way so `tools/host_bench` keeps building on the host.
   - `components/fluid_app/` holds everything ESP-specific: panel, tasks, IMU, touch, buttons, NVS settings, the LVGL menu (`fluid_menu.c`, allocator in `lv_mem_core_psram.c`) and Kconfig.
-  - `components/watch_rtc/` is a minimal PCF85063 driver (I2C 0x51 on the BSP bus). Move it to core `watch_board` if another app needs it.
+  - The RTC (`watch_rtc.h`) and NVS init (`watch_nvs.h`) come from core `watch_board` (>= v0.3.0). Settings use the `fluid` NVS namespace only.
 - Design, budget, measurements and next steps: `docs/FLUID_DESIGN.md`. Update its measurements table when tuning on hardware.
 - Durable config lives in `sdkconfig.defaults`, `partitions.csv`, component manifests and `dependencies.lock`. `sdkconfig`, `build/` and `managed_components/` are generated.
 

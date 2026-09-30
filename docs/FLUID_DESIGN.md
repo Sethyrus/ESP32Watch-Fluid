@@ -104,7 +104,7 @@ Todo se reserva al arrancar (el fondo del menu, al abrirlo por primera vez), y n
   - regenerar las paredes tarda ~24 ms una vez por minuto (se pierde aproximadamente un frame);
   - las colisiones cuestan ~2,1 ms por frame con paredes;
   - aun asi el fps sube, porque los digitos ocupan volumen y quedan menos celdas fluidas que resolver.
-- **Hora:** RTC PCF85063 (`components/watch_rtc`).
+- **Hora:** RTC PCF85063 (`watch_rtc.h` de core, que salio de este repo).
   - Al arrancar se copia al reloj del sistema, que se usa con `time()`, sin mas I2C.
   - Si el RTC perdio la hora, se escribe la de compilacion de `watch_rtc.c`.
   - Se ajusta desde el menu.
@@ -180,6 +180,5 @@ Por que el S3 tarda ~50 veces lo del host: el nucleo es in-order, con latencias 
 - **Sincronizar con TE** contra el tearing.
 - **Atenuar el brillo o dormir por inactividad**: fluido quieto y sin tacto durante N s.
 - **Paredes sin tiron:** muestrear las paredes nuevas repartido en varios frames, para evitar los ~24 ms de cada cambio de minuto.
-- **`watch_rtc` a core**, cuando otra app lo necesite.
 - **Giroscopio:** inercia al girar el reloj en su plano.
 - **Colores por particula** (mezcla de dos liquidos).

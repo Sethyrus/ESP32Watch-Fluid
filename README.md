@@ -69,11 +69,10 @@ tools/host_bench/run.sh --clock 1259 --splash 18 --palette 3   # reloj, salpicad
 | `main/main.c` | Arranque. |
 | `components/fluid_engine/` | Motor en C puro: simulacion FLIP con paredes (`fluid_sim`), digitos del reloj (`fluid_clock`), rejilla LED (`fluid_raster`) y render por franjas con deteccion de cambios (`fluid_render`). |
 | `components/fluid_app/` | Parte ESP32: pantalla, tareas (simulacion en el core 1, render y DMA en el core 0), IMU, tacto, botones, NVS, menu LVGL (`fluid_menu`) y Kconfig. |
-| `components/watch_rtc/` | Driver minimo del RTC PCF85063. Candidato a pasar a `watch_board` en core. |
 | `tools/host_bench/` | Benchmark y comprobaciones en el ordenador. |
 | `docs/FLUID_DESIGN.md` | Analisis, decisiones, presupuesto de rendimiento, medidas y siguientes pasos. |
 
-El IMU y los botones vienen del componente `watch_board` de [ESP32Watch-core](https://github.com/Sethyrus/ESP32Watch-core), donde tambien esta la documentacion de hardware.
+El IMU, los botones, el RTC y la init de NVS vienen del componente `watch_board` de [ESP32Watch-core](https://github.com/Sethyrus/ESP32Watch-core), donde tambien esta la documentacion de hardware.
 
 ## Creditos y licencia
 
