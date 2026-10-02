@@ -32,7 +32,7 @@ Tambien es un reloj: los digitos de la hora son paredes, y el fluido fluye a su 
 Requiere `ESP-IDF 5.5.4` (ver [SETUP](https://github.com/Sethyrus/ESP32Watch-core/blob/main/docs/SETUP.md)).
 
 ```sh
-source "$HOME/.espressif/v5.5.4/esp-idf/export.sh"
+source "$HOME/.espressif/tools/activate_idf_v5.5.4.sh"   # EIM; otras instalaciones: core docs/SETUP.md
 idf.py set-target esp32s3
 idf.py build
 idf.py -p <PORT> flash monitor   # p. ej. /dev/tty.usbmodem1101; sin -p lo autodetecta

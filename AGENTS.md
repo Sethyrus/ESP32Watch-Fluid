@@ -4,16 +4,16 @@
 - ESP-IDF C firmware `ESP32WatchFluid`: a real-time FLIP/PIC fluid simulation driven by the IMU, drawn straight to the AMOLED; LVGL only runs for the settings menu. It doubles as a clock: the time digits are walls the fluid flows around. The entrypoint is `app_main()` in `main/main.c`, which only calls `fluid_app_start()`.
 - Target hardware is Waveshare `ESP32-S3-Touch-AMOLED-2.06`: ESP32-S3R8, AMOLED 410x502 QSPI, FT3168 touch, QMI8658 IMU, AXP2101 PMU.
 - Baseline stack is `ESP-IDF 5.5.4 + waveshare/esp32_s3_touch_amoled_2_06` BSP. LVGL 9.3.0 is pinned. It only runs for the PWR menu (`fluid_menu.c`), inside the render task, with no esp_lvgl_port. Do not migrate to ESP-IDF 6.x unless explicitly requested.
-- Shared board services (`imu_service.h`, `watch_buttons.h`, `watch_rtc.h`, `watch_nvs.h`, `watch_launcher.h`) come from `watch_board` in https://github.com/Sethyrus/ESP32Watch-core, pinned by tag in `main/idf_component.yml`. Fix hardware bugs there, not in local copies. Hardware docs live in that repo's `docs/`.
+- Shared board services (`imu_service.h`, `watch_buttons.h`, `watch_rtc.h`, `watch_nvs.h`, `watch_launcher.h`) come from `watch_board` in https://github.com/Sethyrus/ESP32Watch-core, pinned by tag in `main/idf_component.yml` (v0.5.1). Fix hardware bugs there, not in local copies. Hardware docs live in that repo's `docs/`.
 - Components:
   - `components/fluid_engine/` is pure C with no ESP-IDF includes: `fluid_sim` (FLIP plus walls), `fluid_clock` (7-segment digits as an SDF), `fluid_raster` (particles to LED grid) and `fluid_render` (RGB565 bands plus dirty detection). Keep it that way so `tools/host_bench` keeps building on the host.
   - `components/fluid_app/` holds everything ESP-specific: panel, tasks, IMU, touch, buttons, NVS settings, the LVGL menu (`fluid_menu.c`, allocator in `lv_mem_core_psram.c`) and Kconfig.
-  - The RTC (`watch_rtc.h`) and NVS init (`watch_nvs.h`) come from core `watch_board` (>= v0.3.0). Settings use the `fluid` NVS namespace only.
+  - The RTC (`watch_rtc.h`) and NVS init (`watch_nvs.h`) come from core `watch_board`. Settings use the `fluid` NVS namespace only.
 - Design, budget, measurements and next steps: `docs/FLUID_DESIGN.md`. Update its measurements table when tuning on hardware.
 - Durable config lives in `sdkconfig.defaults`, `partitions.csv`, component manifests and `dependencies.lock`. `sdkconfig`, `build/` and `managed_components/` are generated.
 
 ## Commands
-- Source ESP-IDF: `source "$HOME/.espressif/v5.5.4/esp-idf/export.sh"`.
+- Source ESP-IDF: `source "$HOME/.espressif/tools/activate_idf_v5.5.4.sh"` (EIM install; otherwise core `docs/SETUP.md`).
 - First setup or fresh config: `idf.py set-target esp32s3`.
 - Build (primary verification): `idf.py build`.
 - Flash and monitor: `idf.py -p <PORT> flash monitor`. The macOS port looks like `/dev/tty.usbmodem*` and changes with the USB socket; `idf.py` auto-detects it if `-p` is omitted.
@@ -44,6 +44,7 @@
   - BOOT short press cycles the style, and BOOT long press cycles the palette (shortcuts). Inside the menu, BOOT closes it.
   - Holding PWR for ~6 s powers the board off.
 - Launcher mode (core `watch_launcher.h`): `app_main` calls `watch_launcher_boot_once()` first. The menu shows `Salir al launcher` only when `watch_launcher_is_available()`; `run_menu()` saves the settings and then calls `watch_launcher_exit()`. `partitions.csv` is a copy of the shared table in ESP32Watch-Launcher; do not change it here alone.
+- Never write AXP2101 power or protection registers; read core `docs/PMU_SAFETY.md` before any PMU access. Core fixes reach this app by bumping the `watch_board` tag (core `AGENTS.md`, "Alineacion De Repos").
 - **Walls and clock.**
   - `fluid_set_walls()` samples the SDF once, which costs ~24 ms on the S3, so call it only when the minute changes.
   - Faces against static solids are zeroed in P2G; do not go back to keeping the previous value there (it pumps fluid).
